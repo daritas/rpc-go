@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 )
 
@@ -15,16 +16,31 @@ type Server struct {
 	name       string
 	methods    map[string]map[string]Handler
 	semantics  map[string]map[string]MethodSemantics
+	namespaces map[string]NamespaceOptions
+	described  map[string]map[string]MethodDescription
 	receivedAt func() time.Time
 }
 
 func NewServer(name string) *Server {
-	return &Server{
+	server := &Server{
 		name:       name,
 		methods:    map[string]map[string]Handler{},
 		semantics:  map[string]map[string]MethodSemantics{},
+		namespaces: map[string]NamespaceOptions{},
+		described:  map[string]map[string]MethodDescription{},
 		receivedAt: time.Now,
 	}
+	server.ExposeFunc("msgrpc", "describe", func(context.Context, []any) (any, error) {
+		return server.Describe(), nil
+	})
+	server.DescribeMethod("msgrpc", MethodDescription{
+		Name:      "describe",
+		Params:    []TypeNode{},
+		Returns:   TypeNode{"kind": "ref", "name": "msgrpc.ServerDescription"},
+		Semantics: SemanticsQuery,
+	})
+	server.SetNamespace("msgrpc", NamespaceOptions{ClassName: "Introspection"})
+	return server
 }
 
 func (s *Server) Name() string {
@@ -36,6 +52,29 @@ func (s *Server) ExposeFunc(namespace, method string, handler Handler) {
 		s.methods[namespace] = map[string]Handler{}
 	}
 	s.methods[namespace][method] = handler
+	if s.described[namespace] == nil {
+		s.described[namespace] = map[string]MethodDescription{}
+	}
+	if _, exists := s.described[namespace][method]; !exists {
+		s.described[namespace][method] = MethodDescription{Name: method}
+	}
+}
+
+func (s *Server) SetNamespace(namespace string, options NamespaceOptions) {
+	s.namespaces[namespace] = options
+}
+
+func (s *Server) DescribeMethod(namespace string, description MethodDescription) {
+	if description.Name == "" {
+		return
+	}
+	if s.described[namespace] == nil {
+		s.described[namespace] = map[string]MethodDescription{}
+	}
+	if description.Semantics != "" {
+		s.DeclareSemantics(namespace, description.Name, description.Semantics)
+	}
+	s.described[namespace][description.Name] = description
 }
 
 func (s *Server) DeclareSemantics(namespace, method string, semantics MethodSemantics) {
@@ -48,6 +87,51 @@ func (s *Server) DeclareSemantics(namespace, method string, semantics MethodSema
 func (s *Server) Semantics(namespace, method string) (MethodSemantics, bool) {
 	semantics, ok := s.semantics[namespace][method]
 	return semantics, ok
+}
+
+func (s *Server) Describe() ServerDescription {
+	namespaces := make([]string, 0, len(s.methods))
+	for namespace := range s.methods {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+
+	description := ServerDescription{
+		Name:       s.name,
+		Validating: false,
+		Namespaces: make([]NamespaceDescription, 0, len(namespaces)),
+	}
+	for _, namespace := range namespaces {
+		options := s.namespaces[namespace]
+		methods := make([]MethodDescription, 0, len(s.methods[namespace]))
+		names := make([]string, 0, len(s.methods[namespace]))
+		for name := range s.methods[namespace] {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			method := s.described[namespace][name]
+			if method.Name == "" {
+				method.Name = name
+			}
+			if method.Semantics == "" {
+				if semantics, ok := s.Semantics(namespace, name); ok {
+					method.Semantics = semantics
+				}
+			}
+			methods = append(methods, method)
+		}
+		description.Namespaces = append(description.Namespaces, NamespaceDescription{
+			Name:      namespace,
+			Version:   options.Version,
+			ClassName: options.ClassName,
+			Created:   false,
+			Emitter:   options.Emitter,
+			Methods:   methods,
+			Events:    []EventDescription{},
+		})
+	}
+	return description
 }
 
 func (s *Server) Expose(namespace string, receiver any) error {

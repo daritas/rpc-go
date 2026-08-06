@@ -22,6 +22,7 @@ func main() {
 	name := env("SOURCE_RPC_GO_EXAMPLE_NAME", "goCalculator")
 
 	server := rpc.NewServer(name)
+	server.SetNamespace("calculator", rpc.NamespaceOptions{Version: "1", ClassName: "Calculator"})
 	server.ExposeFunc("calculator", "add", func(ctx context.Context, params []any) (any, error) {
 		_ = ctx
 		if len(params) != 2 {
@@ -33,6 +34,11 @@ func main() {
 			return nil, &rpc.RPCError{Code: rpc.ErrorInvalidParams, Err: &rpc.RemoteError{Name: "RpcError", Message: "calculator.add expects two numbers"}}
 		}
 		return a + b, nil
+	})
+	server.DescribeMethod("calculator", rpc.MethodDescription{
+		Name:    "add",
+		Params:  []rpc.TypeNode{rpc.TypeNumber(), rpc.TypeNumber()},
+		Returns: rpc.TypeNumber(),
 	})
 
 	transport := rpcmqtt.NewTransport(rpcmqtt.TransportOptions{
