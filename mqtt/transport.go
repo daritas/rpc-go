@@ -390,6 +390,9 @@ func (t *Transport) answerSubscription(source string, packet *paho.Publish, fram
 }
 
 func (t *Transport) answer(source string, packet *paho.Publish, frame Frame, reply any) {
+	if reply == nil {
+		return
+	}
 	replyFrame, ok := ToFrame(rpc.Message{Payload: reply})
 	if !ok {
 		return

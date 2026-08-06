@@ -20,6 +20,8 @@ type Server struct {
 	described  map[string]map[string]MethodDescription
 	events     map[string]map[string]EventDescription
 	receivedAt func() time.Time
+
+	idempotency IdempotencyStore
 }
 
 func NewServer(name string) *Server {
@@ -47,6 +49,10 @@ func NewServer(name string) *Server {
 
 func (s *Server) Name() string {
 	return s.name
+}
+
+func (s *Server) UseIdempotency(store IdempotencyStore) {
+	s.idempotency = store
 }
 
 func (s *Server) ExposeFunc(namespace, method string, handler Handler) {
@@ -241,7 +247,6 @@ func (s *Server) Dispatch(ctx context.Context, source string, call CallPayload) 
 }
 
 func (s *Server) DispatchArrived(ctx context.Context, source string, call CallPayload, arrived time.Time) any {
-	_ = source
 	if call.Type != "" && call.Type != RPCMessageCall {
 		return NewErrorPayload(call.ID, ErrorInvalidParams, "payload is not a call")
 	}
@@ -256,15 +261,66 @@ func (s *Server) DispatchArrived(ctx context.Context, source string, call CallPa
 	if handler == nil {
 		return NewErrorPayload(call.ID, ErrorMethodNotFound, fmt.Sprintf("%s.%s is not exposed", call.Path, call.Method))
 	}
+	invocation, hasInvocation := s.invocationFor(call, source)
+	claimed := false
+	if hasInvocation {
+		outcome, decision, err := s.idempotency.Begin(ctx, invocation)
+		if err != nil {
+			return NewErrorPayload(call.ID, ErrorUnknownOutcome, fmt.Sprintf("%s.%s was not run: its idempotency store could not be reached (%s)", call.Path, call.Method, err.Error()))
+		}
+		switch decision {
+		case IdempotencyInProgress:
+			return nil
+		case IdempotencyCompleted:
+			return outcome.Reply(call.ID)
+		case IdempotencyAcquired:
+			claimed = true
+		default:
+			return NewErrorPayload(call.ID, ErrorUnknownOutcome, fmt.Sprintf("%s.%s was not run: its idempotency store returned an unknown decision", call.Path, call.Method))
+		}
+	}
 	result, err := handler(ctx, call.Params)
 	if err != nil {
 		var rpcErr *RPCError
 		if ok := AsRPCError(err, &rpcErr); ok && rpcErr != nil {
-			return ErrorPayload{ID: call.ID, Type: RPCMessageError, Code: rpcErr.Code, Error: rpcErr.Err}
+			reply := ErrorPayload{ID: call.ID, Type: RPCMessageError, Code: rpcErr.Code, Error: rpcErr.Err}
+			s.completeIdempotency(ctx, invocation, claimed, StoredOutcome{Code: reply.Code, Error: reply.Error})
+			return reply
 		}
-		return NewErrorPayload(call.ID, ErrorException, err.Error())
+		reply := NewErrorPayload(call.ID, ErrorException, err.Error())
+		s.completeIdempotency(ctx, invocation, claimed, StoredOutcome{Code: reply.Code, Error: reply.Error})
+		return reply
 	}
+	s.completeIdempotency(ctx, invocation, claimed, StoredOutcome{Result: result})
 	return NewSuccessPayload(call.ID, result)
+}
+
+func (s *Server) invocationFor(call CallPayload, source string) (Invocation, bool) {
+	if s.idempotency == nil {
+		return Invocation{}, false
+	}
+	semantics, ok := s.Semantics(call.Path, call.Method)
+	if !ok || semantics != SemanticsNonRepeatableCommand {
+		return Invocation{}, false
+	}
+	key := call.IdempotencyKey
+	if key == "" {
+		key = call.ID
+	}
+	return Invocation{
+		IdempotencyKey: key,
+		RequestID:      call.ID,
+		Scope:          call.Path + "." + call.Method,
+		Source:         source,
+		TTL:            call.TTL,
+	}, true
+}
+
+func (s *Server) completeIdempotency(ctx context.Context, invocation Invocation, claimed bool, outcome StoredOutcome) {
+	if !claimed || s.idempotency == nil {
+		return
+	}
+	_ = s.idempotency.Complete(ctx, invocation, outcome)
 }
 
 func reflectedHandler(method reflect.Value, name string) Handler {

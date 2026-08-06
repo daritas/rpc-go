@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -205,4 +206,135 @@ func TestExposeServiceReceiverMethodWithWireName(t *testing.T) {
 	if success.Result != 5 {
 		t.Fatalf("result = %v, want 5", success.Result)
 	}
+}
+
+func TestServerCachesNonRepeatableCommandOutcome(t *testing.T) {
+	server := NewServer("plantServer")
+	server.UseIdempotency(NewMemoryIdempotencyStore(10))
+	runs := 0
+	server.ExposeMethod("gate", "startPump", func(context.Context, []any) (any, error) {
+		runs++
+		return "start 1", nil
+	}, Semantics(SemanticsNonRepeatableCommand))
+
+	first := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:             "request-1",
+		Type:           RPCMessageCall,
+		Path:           "gate",
+		Method:         "startPump",
+		IdempotencyKey: "work-order-42",
+	})
+	second := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:             "request-2",
+		Type:           RPCMessageCall,
+		Path:           "gate",
+		Method:         "startPump",
+		IdempotencyKey: "work-order-42",
+	})
+
+	if runs != 1 {
+		t.Fatalf("runs = %d, want 1", runs)
+	}
+	if first.(SuccessPayload).Result != "start 1" {
+		t.Fatalf("first = %#v, want cached result", first)
+	}
+	success, ok := second.(SuccessPayload)
+	if !ok {
+		t.Fatalf("second = %T, want SuccessPayload", second)
+	}
+	if success.ID != "request-2" || success.Result != "start 1" {
+		t.Fatalf("second = %#v, want cached result with new request id", success)
+	}
+}
+
+func TestServerDoesNotUseIdempotencyForQueries(t *testing.T) {
+	store := &recordingStore{}
+	server := NewServer("plantServer")
+	server.UseIdempotency(store)
+	server.ExposeMethod("gate", "readMode", func(context.Context, []any) (any, error) {
+		return "auto", nil
+	}, Semantics(SemanticsQuery))
+
+	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "gate",
+		Method: "readMode",
+	})
+	if _, ok := reply.(SuccessPayload); !ok {
+		t.Fatalf("reply = %T, want SuccessPayload", reply)
+	}
+	if store.begun != 0 {
+		t.Fatalf("begin called %d times, want 0", store.begun)
+	}
+}
+
+func TestServerRefusesCommandWhenIdempotencyStoreFails(t *testing.T) {
+	store := &recordingStore{err: errors.New("store down")}
+	server := NewServer("plantServer")
+	server.UseIdempotency(store)
+	ran := false
+	server.ExposeMethod("gate", "startPump", func(context.Context, []any) (any, error) {
+		ran = true
+		return "started", nil
+	}, Semantics(SemanticsNonRepeatableCommand))
+
+	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "gate",
+		Method: "startPump",
+	})
+	failure, ok := reply.(ErrorPayload)
+	if !ok {
+		t.Fatalf("reply = %T, want ErrorPayload", reply)
+	}
+	if failure.Code != ErrorUnknownOutcome {
+		t.Fatalf("code = %s, want %s", failure.Code, ErrorUnknownOutcome)
+	}
+	if ran {
+		t.Fatal("handler ran even though the idempotency store failed")
+	}
+}
+
+func TestServerDropsInProgressDuplicate(t *testing.T) {
+	store := &recordingStore{decision: IdempotencyInProgress}
+	server := NewServer("plantServer")
+	server.UseIdempotency(store)
+	server.ExposeMethod("gate", "startPump", func(context.Context, []any) (any, error) {
+		t.Fatal("in-progress duplicate should not run")
+		return nil, nil
+	}, Semantics(SemanticsNonRepeatableCommand))
+
+	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "gate",
+		Method: "startPump",
+	})
+	if reply != nil {
+		t.Fatalf("reply = %#v, want nil", reply)
+	}
+}
+
+type recordingStore struct {
+	begun    int
+	decision IdempotencyDecision
+	outcome  StoredOutcome
+	err      error
+}
+
+func (s *recordingStore) Begin(context.Context, Invocation) (StoredOutcome, IdempotencyDecision, error) {
+	s.begun++
+	if s.err != nil {
+		return StoredOutcome{}, IdempotencyAcquired, s.err
+	}
+	if s.decision == 0 {
+		return StoredOutcome{}, IdempotencyAcquired, nil
+	}
+	return s.outcome, s.decision, nil
+}
+
+func (s *recordingStore) Complete(context.Context, Invocation, StoredOutcome) error {
+	return nil
 }

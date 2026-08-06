@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -50,12 +51,26 @@ func (c *Client) Call(ctx context.Context, target, path, method string, params [
 	if c.transport == nil {
 		return &RPCError{Code: ErrorTransport, Err: &RemoteError{Name: "RpcError", Message: "no transport configured"}}
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var callOptions CallOptions
 	if len(options) > 0 {
 		callOptions = options[0]
 	}
+	timeout, err := c.effectiveTimeout(ctx, callOptions.Timeout)
+	if err != nil {
+		return err
+	}
+	callOptions.Timeout = timeout
 	call := c.NewCall(path, method, params, callOptions)
-	value, err := c.transport.Call(ctx, c.name, target, call)
+	callCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	value, err := c.transport.Call(callCtx, c.name, target, call)
 	if err != nil {
 		return err
 	}
@@ -96,12 +111,32 @@ func (c *Client) NewCall(path, method string, params []any, options CallOptions)
 		IdempotencyKey: options.IdempotencyKey,
 	}
 	if timeout > 0 {
-		call.TTL = int64(timeout / time.Millisecond)
+		call.TTL = durationMilliseconds(timeout)
 	}
 	if options.OwnerEpoch != "" {
 		call.Fence = &OwnerFence{OwnerEpoch: options.OwnerEpoch}
 	}
 	return call
+}
+
+func (c *Client) effectiveTimeout(ctx context.Context, requested time.Duration) (time.Duration, error) {
+	timeout := requested
+	if timeout < 0 {
+		return 0, &RPCError{Code: ErrorInvalidParams, Err: &RemoteError{Name: "RpcError", Message: fmt.Sprintf("timeout must be non-negative, not %s", requested)}}
+	}
+	if timeout == 0 {
+		timeout = c.timeout
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, &RPCError{Code: ErrorTimeout, Err: &RemoteError{Name: "RpcError", Message: ctx.Err().Error()}}
+		}
+		if timeout == 0 || remaining < timeout {
+			timeout = remaining
+		}
+	}
+	return timeout, nil
 }
 
 func NewID() string {
@@ -110,4 +145,18 @@ func NewID() string {
 		return time.Now().UTC().Format("20060102150405.000000000")
 	}
 	return hex.EncodeToString(bytes[:])
+}
+
+func durationMilliseconds(timeout time.Duration) int64 {
+	if timeout <= 0 {
+		return 0
+	}
+	ms := timeout / time.Millisecond
+	if timeout%time.Millisecond != 0 {
+		ms++
+	}
+	if ms == 0 {
+		return 1
+	}
+	return int64(ms)
 }
