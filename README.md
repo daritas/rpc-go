@@ -60,6 +60,10 @@ instead of a skip.
 Set `MSGRPC_TEST_INTEROP_PEER=<peer>` to have the Go client call a live Source RPC peer exposing
 `calculator.add(number, number)`.
 
+Signed TypeScript interop tests run when a built `@source-repo/rpc` dist is found next to this repo
+as `rpc-ts` or `msgrpc`; set `MSGRPC_TEST_TS_DIST=/path/to/packages/rpc/dist/index.js` to use another
+checkout.
+
 `examples/calculator_server` serves `calculator.add` and emits `calculator.changed` with the sum.
 
 ## MQTT Signing
