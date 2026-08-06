@@ -164,6 +164,20 @@ func IsRequestKind(kind Kind) bool {
 	return kind == KindCall || kind == KindSubscribe || kind == KindUnsubscribe
 }
 
+func methodOrEvent(frame Frame) string {
+	if frame.Method != "" {
+		return frame.Method
+	}
+	return frame.Event
+}
+
+func methodOrEventProperties(properties map[string]string) string {
+	if properties[MRMethod] != "" {
+		return properties[MRMethod]
+	}
+	return properties[MREvent]
+}
+
 func ToFrame(message rpc.Message) (Frame, bool) {
 	switch payload := message.Payload.(type) {
 	case rpc.CallPayload:

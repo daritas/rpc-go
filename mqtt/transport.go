@@ -32,6 +32,10 @@ type TransportOptions struct {
 	SubscribePresence    bool
 	Username             string
 	Password             string
+	Signer               MessageSigner
+	Verifier             MessageVerifier
+	MaxClockSkew         time.Duration
+	MaxTrackedNonces     int
 }
 
 type Transport struct {
@@ -46,6 +50,8 @@ type Transport struct {
 	pending             map[string]chan response
 	events              map[string]map[uint64]rpc.EventHandler
 	serverSubscriptions map[string]map[string]struct{}
+	peerIdentities      map[string]*rpc.Identity
+	replayGuard         *ReplayGuard
 	nextSubscriptionID  uint64
 	closed              bool
 }
@@ -77,11 +83,20 @@ func NewTransport(options TransportOptions) *Transport {
 		pending:             map[string]chan response{},
 		events:              map[string]map[uint64]rpc.EventHandler{},
 		serverSubscriptions: map[string]map[string]struct{}{},
+		peerIdentities:      map[string]*rpc.Identity{},
+		replayGuard:         NewReplayGuard(options.MaxClockSkew, options.MaxTrackedNonces),
 	}
 }
 
 func (t *Transport) Name() string {
 	return t.options.Name
+}
+
+func (t *Transport) Identity(source string) (*rpc.Identity, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	identity, ok := t.peerIdentities[source]
+	return identity, ok
 }
 
 func (t *Transport) Connect(ctx context.Context) error {
@@ -457,17 +472,55 @@ func (t *Transport) publishFrameToTopic(ctx context.Context, source string, topi
 	}
 	properties := &paho.PublishProperties{
 		ContentType: contentType,
-		User:        userProperties(frame.ControlProperties(source)),
 	}
+	control := frame.ControlProperties(source)
 	properties.PayloadFormat = payloadFormat(contentType)
 	if frame.Correlation != "" {
 		properties.CorrelationData = []byte(frame.Correlation)
 	}
+	responseTopic := ""
 	if IsRequestKind(frame.Kind) {
-		properties.ResponseTopic = Topic(t.options.Prefix, ChannelResponse, source)
+		responseTopic = Topic(t.options.Prefix, ChannelResponse, source)
+		properties.ResponseTopic = responseTopic
 		expiry := requestExpiry(frame.TTL, t.options.RequestExpirySeconds)
 		properties.MessageExpiry = &expiry
 	}
+	if t.options.Signer != nil {
+		nonce, err := createNonce()
+		if err != nil {
+			return err
+		}
+		timestamp := time.Now().UnixMilli()
+		canonical, err := CanonicalSignedBytesV5(SignedFrameV5{
+			Version:         FrameVersion,
+			Topic:           topic,
+			ResponseTopic:   responseTopic,
+			Source:          source,
+			Kind:            string(frame.Kind),
+			Path:            frame.Path,
+			MethodOrEvent:   methodOrEvent(frame),
+			Correlation:     frame.Correlation,
+			ContentType:     contentType,
+			Code:            string(frame.Code),
+			ContractVersion: frame.Version,
+			TTL:             control[MRTTL],
+			IdempotencyKey:  frame.IdempotencyKey,
+			Timestamp:       timestamp,
+			Nonce:           nonce,
+			Payload:         body,
+		})
+		if err != nil {
+			return err
+		}
+		signature, err := t.options.Signer.Sign(ctx, canonical, SigningContext{Source: source})
+		if err != nil {
+			return err
+		}
+		control[MRNonce] = nonce
+		control[MRTimestamp] = strconv.FormatInt(timestamp, 10)
+		control[MRSignature] = signature
+	}
+	properties.User = userProperties(control)
 	_, err = t.client.Publish(ctx, &paho.Publish{
 		Topic:      topic,
 		QoS:        t.options.QoS,
@@ -485,6 +538,11 @@ func (t *Transport) decodePublish(packet *paho.Publish) (Frame, string, string, 
 	if err != nil {
 		return Frame{}, "", "", err
 	}
+	if t.options.Verifier != nil {
+		if err := t.verifyPublish(context.Background(), packet, properties); err != nil {
+			return Frame{}, "", "", err
+		}
+	}
 	contentType := packet.Properties.ContentType
 	if contentType == "" {
 		contentType = t.codec.ContentType()
@@ -498,6 +556,66 @@ func (t *Transport) decodePublish(packet *paho.Publish) (Frame, string, string, 
 		return Frame{}, "", "", errors.New("invalid control properties")
 	}
 	return frame, properties[MRSource], contentType, nil
+}
+
+func (t *Transport) verifyPublish(ctx context.Context, packet *paho.Publish, properties map[string]string) error {
+	source := properties[MRSource]
+	signature := properties[MRSignature]
+	nonce := properties[MRNonce]
+	timestamp, err := strconv.ParseInt(properties[MRTimestamp], 10, 64)
+	if signature == "" || nonce == "" || err != nil {
+		return errors.New("unsigned")
+	}
+	version := properties[MRVersion]
+	if version == "" {
+		version = FrameVersion
+	}
+	if version != FrameVersion {
+		return fmt.Errorf("signed frame version %q is not supported", version)
+	}
+	if !t.replayGuard.Accept(nonce, timestamp) {
+		return errors.New("stale or replayed")
+	}
+	responseTopic := ""
+	if IsRequestKind(Kind(properties[MRKind])) {
+		responseTopic = packet.Properties.ResponseTopic
+	}
+	correlation := string(packet.Properties.CorrelationData)
+	canonical, err := CanonicalSignedBytesV5(SignedFrameV5{
+		Version:         version,
+		Topic:           packet.Topic,
+		ResponseTopic:   responseTopic,
+		Source:          source,
+		Kind:            properties[MRKind],
+		Path:            properties[MRPath],
+		MethodOrEvent:   methodOrEventProperties(properties),
+		Correlation:     correlation,
+		ContentType:     packet.Properties.ContentType,
+		Code:            properties[MRCode],
+		ContractVersion: properties[MRContractVersion],
+		TTL:             properties[MRTTL],
+		IdempotencyKey:  properties[MRIdempotencyKey],
+		Timestamp:       timestamp,
+		Nonce:           nonce,
+		Payload:         packet.Payload,
+	})
+	if err != nil {
+		return err
+	}
+	identity, err := t.options.Verifier.Verify(ctx, canonical, signature, SigningContext{Source: source})
+	if err != nil {
+		return fmt.Errorf("verifier error: %w", err)
+	}
+	if identity == nil {
+		return errors.New("bad signature")
+	}
+	if identity.Name != source {
+		return errors.New("identity does not match source")
+	}
+	t.mu.Lock()
+	t.peerIdentities[source] = identity
+	t.mu.Unlock()
+	return nil
 }
 
 func (t *Transport) decodeBody(contentType string, payload []byte) (any, error) {

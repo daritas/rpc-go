@@ -145,6 +145,74 @@ func TestTransportDeliversEvents(t *testing.T) {
 	}
 }
 
+func TestTransportSignedCallAgainstBroker(t *testing.T) {
+	brokerURL := os.Getenv("MSGRPC_TEST_BROKER")
+	if brokerURL == "" {
+		brokerURL = "mqtt://localhost:1883"
+	}
+	requireBroker(t, tcpAddress(t, brokerURL))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	prefix := "msgrpc/go-test/" + rpc.NewID()
+	secrets := map[string]string{
+		"goSignedServer": "server-secret",
+		"goSignedClient": "client-secret",
+	}
+
+	server := rpc.NewServer("goSignedServer")
+	if err := server.Expose("calculator", integrationCalculator{}); err != nil {
+		t.Fatal(err)
+	}
+	serverVerifier := NewHMACVerifier(secrets)
+	serverTransport := NewTransport(TransportOptions{
+		URL:             brokerURL,
+		Name:            "goSignedServer",
+		Prefix:          prefix,
+		PublishPresence: true,
+		Username:        os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password:        os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+		Signer:          NewHMACSigner(secrets["goSignedServer"]),
+		Verifier:        serverVerifier,
+	})
+	serverTransport.AttachServer(server)
+	if err := serverTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer serverTransport.Close(context.Background())
+
+	clientTransport := NewTransport(TransportOptions{
+		URL:             brokerURL,
+		Name:            "goSignedClient",
+		Prefix:          prefix,
+		PublishPresence: true,
+		Username:        os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password:        os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+		Signer:          NewHMACSigner(secrets["goSignedClient"]),
+		Verifier:        NewHMACVerifier(secrets),
+	})
+	if err := clientTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer clientTransport.Close(context.Background())
+
+	client := rpc.NewClient("goSignedClient")
+	client.Use(clientTransport)
+
+	var result int
+	if err := client.Call(ctx, "goSignedServer", "calculator", "Add", []any{2, 3}, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result != 5 {
+		t.Fatalf("result = %d, want 5", result)
+	}
+	identity, ok := serverTransport.Identity("goSignedClient")
+	if !ok || identity.Name != "goSignedClient" {
+		t.Fatalf("identity = %#v, %v; want goSignedClient", identity, ok)
+	}
+}
+
 func TestTransportCallsSourceRPCPeer(t *testing.T) {
 	peer := os.Getenv("MSGRPC_TEST_INTEROP_PEER")
 	if peer == "" {

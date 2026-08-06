@@ -61,3 +61,10 @@ Set `MSGRPC_TEST_INTEROP_PEER=<peer>` to have the Go client call a live Source R
 `calculator.add(number, number)`.
 
 `examples/calculator_server` serves `calculator.add` and emits `calculator.changed` with the sum.
+
+## MQTT Signing
+
+Configure `mqtt.TransportOptions.Signer` and `Verifier` to require signed MQTT 5 frames. The built-in
+`mqtt.NewHMACSigner` and `mqtt.NewHMACVerifier` implement the same canonical v2 signing input as the
+TypeScript package, including topic, response topic, content type, error code, contract version, TTL,
+idempotency key, timestamp, nonce and raw payload bytes. A verifier also enables replay protection.
