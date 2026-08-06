@@ -69,15 +69,14 @@ func TestServerRefusesExpiredCalls(t *testing.T) {
 
 func TestServerDescribesExposedMethods(t *testing.T) {
 	server := NewServer("plantServer")
-	server.SetNamespace("calculator", NamespaceOptions{Version: "1", ClassName: "Calculator"})
-	server.ExposeFunc("calculator", "add", func(context.Context, []any) (any, error) {
-		return 5, nil
-	})
-	server.DescribeMethod("calculator", MethodDescription{
-		Name:    "add",
-		Params:  []TypeNode{TypeNumber(), TypeNumber()},
-		Returns: TypeNumber(),
-	})
+	if err := server.ExposeService("calculator", nil,
+		WithNamespace(NamespaceVersion("1"), NamespaceClassName("Calculator")),
+		WithMethods(Method("add", func(a, b int) (int, error) {
+			return a + b, nil
+		}, Params(TypeNumber(), TypeNumber()), Returns(TypeNumber()))),
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	description := server.Describe()
 	if description.Name != "plantServer" {
@@ -103,6 +102,32 @@ func TestServerDescribesExposedMethods(t *testing.T) {
 	}
 }
 
+func TestExposeServiceDispatchesTypedFunction(t *testing.T) {
+	server := NewServer("plantServer")
+	if err := server.ExposeService("calculator", nil,
+		WithMethods(Method("add", func(a, b int) (int, error) {
+			return 5, nil
+		}, Params(TypeNumber(), TypeNumber()), Returns(TypeNumber()))),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "calculator",
+		Method: "add",
+		Params: []any{2, 3},
+	})
+	success, ok := reply.(SuccessPayload)
+	if !ok {
+		t.Fatalf("reply = %T, want SuccessPayload", reply)
+	}
+	if success.Result != 5 {
+		t.Fatalf("result = %v, want 5", success.Result)
+	}
+}
+
 func TestServerDispatchesDescribe(t *testing.T) {
 	server := NewServer("plantServer")
 	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
@@ -123,5 +148,61 @@ func TestServerDispatchesDescribe(t *testing.T) {
 	}
 	if description.Name != "plantServer" {
 		t.Fatalf("name = %s, want plantServer", description.Name)
+	}
+}
+
+func TestExposeFunctionDispatchesWithDescription(t *testing.T) {
+	server := NewServer("plantServer")
+	server.ExposeFunction("calculator", "add", func(a, b int) (int, error) {
+		return a + b, nil
+	}, Params(TypeNumber(), TypeNumber()), Returns(TypeNumber()))
+
+	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "calculator",
+		Method: "add",
+		Params: []any{2, 3},
+	})
+	success, ok := reply.(SuccessPayload)
+	if !ok {
+		t.Fatalf("reply = %T, want SuccessPayload", reply)
+	}
+	if success.Result != 5 {
+		t.Fatalf("result = %v, want 5", success.Result)
+	}
+	method := server.Describe().Namespaces[0].Methods[0]
+	if method.Name != "add" || method.Returns["kind"] != "number" {
+		t.Fatalf("method = %#v, want described add", method)
+	}
+}
+
+type receiverCalculator struct{}
+
+func (receiverCalculator) Add(a, b int) (int, error) {
+	return a + b, nil
+}
+
+func TestExposeServiceReceiverMethodWithWireName(t *testing.T) {
+	server := NewServer("plantServer")
+	if err := server.ExposeService("calculator", receiverCalculator{},
+		WithNamespace(NamespaceVersion("1")),
+		WithMethods(ReceiverMethod("Add", WireName("add"), Params(TypeNumber(), TypeNumber()), Returns(TypeNumber()))),
+	); err != nil {
+		t.Fatal(err)
+	}
+	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "calculator",
+		Method: "add",
+		Params: []any{2, 3},
+	})
+	success, ok := reply.(SuccessPayload)
+	if !ok {
+		t.Fatalf("reply = %T, want SuccessPayload", reply)
+	}
+	if success.Result != 5 {
+		t.Fatalf("result = %v, want 5", success.Result)
 	}
 }

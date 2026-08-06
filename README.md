@@ -25,17 +25,15 @@ properties.
 
 ```go
 server := rpc.NewServer("plantServer")
-server.Expose("plant", plant)
-
-reply := server.Dispatch(ctx, "hmi", rpc.CallPayload{
-    ID:     "request-1",
-    Type:   rpc.RPCMessageCall,
-    Path:   "plant",
-    Method: "ReadSetpoint",
+server.ExposeService("calculator", nil,
+    rpc.WithNamespace(rpc.NamespaceVersion("1"), rpc.NamespaceClassName("Calculator")),
+    rpc.WithMethods(rpc.Method("add", func(a, b float64) (float64, error) {
+        return a + b, nil
+    }, rpc.Params(rpc.TypeNumber(), rpc.TypeNumber()), rpc.Returns(rpc.TypeNumber()))),
 })
 ```
 
-The MQTT transport will be responsible for carrying that call on:
+The MQTT transport carries a call to that method on:
 
 ```text
 msgrpc/v2/req/plantServer

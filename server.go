@@ -62,6 +62,59 @@ func (s *Server) ExposeFunc(namespace, method string, handler Handler) {
 	}
 }
 
+func (s *Server) ExposeMethod(namespace, name string, handler Handler, options ...MethodOption) {
+	s.ExposeFunc(namespace, name, handler)
+	description := describeMethod(name, options)
+	description.Name = name
+	s.DescribeMethod(namespace, description)
+}
+
+func (s *Server) ExposeFunction(namespace, name string, function any, options ...MethodOption) {
+	s.ExposeMethod(namespace, name, handlerFromFunction(function, name), options...)
+}
+
+func (s *Server) ExposeService(namespace string, receiver any, options ...ServiceOption) error {
+	service := ServiceOptions{}
+	for _, option := range options {
+		option(&service)
+	}
+	if service.Namespace.ClassName == "" && receiver != nil {
+		typ := reflect.TypeOf(receiver)
+		if typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		service.Namespace.ClassName = typ.Name()
+	}
+	s.SetNamespace(namespace, service.Namespace)
+	if len(service.Methods) == 0 {
+		if receiver == nil {
+			return nil
+		}
+		return s.Expose(namespace, receiver)
+	}
+	value := reflect.ValueOf(receiver)
+	for _, binding := range service.Methods {
+		description := describeMethod(binding.GoName, binding.Options)
+		handler := binding.Handler
+		if handler == nil && binding.Function != nil {
+			handler = handlerFromFunction(binding.Function, binding.GoName)
+		}
+		if handler == nil {
+			method := value.MethodByName(binding.GoName)
+			if !method.IsValid() {
+				return fmt.Errorf("expose service %s: %s is not a method on %T", namespace, binding.GoName, receiver)
+			}
+			handler = reflectedHandler(method, binding.GoName)
+		}
+		s.ExposeFunc(namespace, description.Name, handler)
+		s.DescribeMethod(namespace, description)
+	}
+	for _, event := range service.Events {
+		s.DescribeEvent(namespace, event)
+	}
+	return nil
+}
+
 func (s *Server) SetNamespace(namespace string, options NamespaceOptions) {
 	s.namespaces[namespace] = options
 }

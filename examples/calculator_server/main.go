@@ -11,43 +11,25 @@ import (
 	rpcmqtt "github.com/source-repo/rpc-go/mqtt"
 )
 
-type Calculator struct{}
-
-func (Calculator) add(a, b float64) (float64, error) {
-	return a + b, nil
-}
-
 func main() {
 	broker := env("MSGRPC_TEST_BROKER", "mqtt://localhost:1883")
 	name := env("SOURCE_RPC_GO_EXAMPLE_NAME", "goCalculator")
 
 	server := rpc.NewServer(name)
-	server.SetNamespace("calculator", rpc.NamespaceOptions{Version: "1", ClassName: "Calculator"})
-	server.DescribeEvent("calculator", rpc.EventDescription{
-		Name:   "changed",
-		Params: []rpc.TypeNode{rpc.TypeNumber()},
-	})
 	var transport *rpcmqtt.Transport
-	server.ExposeFunc("calculator", "add", func(ctx context.Context, params []any) (any, error) {
-		if len(params) != 2 {
-			return nil, &rpc.RPCError{Code: rpc.ErrorInvalidParams, Err: &rpc.RemoteError{Name: "RpcError", Message: "calculator.add expects two numbers"}}
-		}
-		a, okA := number(params[0])
-		b, okB := number(params[1])
-		if !okA || !okB {
-			return nil, &rpc.RPCError{Code: rpc.ErrorInvalidParams, Err: &rpc.RemoteError{Name: "RpcError", Message: "calculator.add expects two numbers"}}
-		}
-		result := a + b
-		if transport != nil {
-			_ = transport.PublishEvent(ctx, "calculator", "changed", []any{result})
-		}
-		return result, nil
-	})
-	server.DescribeMethod("calculator", rpc.MethodDescription{
-		Name:    "add",
-		Params:  []rpc.TypeNode{rpc.TypeNumber(), rpc.TypeNumber()},
-		Returns: rpc.TypeNumber(),
-	})
+	if err := server.ExposeService("calculator", nil,
+		rpc.WithNamespace(rpc.NamespaceVersion("1"), rpc.NamespaceClassName("Calculator"), rpc.NamespaceEmitter(true)),
+		rpc.WithEvents(rpc.Event("changed", rpc.TypeNumber())),
+		rpc.WithMethods(rpc.Method("add", func(ctx context.Context, a, b float64) (float64, error) {
+			result := a + b
+			if transport != nil {
+				_ = transport.PublishEvent(ctx, "calculator", "changed", []any{result})
+			}
+			return result, nil
+		}, rpc.Params(rpc.TypeNumber(), rpc.TypeNumber()), rpc.Returns(rpc.TypeNumber()))),
+	); err != nil {
+		log.Fatal(err)
+	}
 
 	transport = rpcmqtt.NewTransport(rpcmqtt.TransportOptions{
 		URL:             broker,
@@ -75,35 +57,4 @@ func env(name, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func number(value any) (float64, bool) {
-	switch v := value.(type) {
-	case float64:
-		return v, true
-	case float32:
-		return float64(v), true
-	case int:
-		return float64(v), true
-	case int8:
-		return float64(v), true
-	case int16:
-		return float64(v), true
-	case int32:
-		return float64(v), true
-	case int64:
-		return float64(v), true
-	case uint:
-		return float64(v), true
-	case uint8:
-		return float64(v), true
-	case uint16:
-		return float64(v), true
-	case uint32:
-		return float64(v), true
-	case uint64:
-		return float64(v), true
-	default:
-		return 0, false
-	}
 }
