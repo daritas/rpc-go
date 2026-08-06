@@ -36,6 +36,14 @@ type TransportOptions struct {
 	Verifier             MessageVerifier
 	MaxClockSkew         time.Duration
 	MaxTrackedNonces     int
+	OnRejected           func(RejectedFrame)
+}
+
+type RejectedFrame struct {
+	Source string
+	Topic  string
+	Reason string
+	Err    error
 }
 
 type Transport struct {
@@ -340,10 +348,12 @@ func (t *Transport) onPublish(pr paho.PublishReceived) (bool, error) {
 	}
 	frame, source, contentType, err := t.decodePublish(packet)
 	if err != nil {
+		t.reject(packet, sourceFromPublish(packet), err.Error(), err)
 		return true, nil
 	}
 	message, ok := FromFrame(frame)
 	if !ok {
+		t.reject(packet, source, "invalid frame", nil)
 		return true, nil
 	}
 	switch frame.Channel {
@@ -397,7 +407,8 @@ func (t *Transport) answerSubscription(source string, identity *rpc.Identity, pa
 			Params:       call.Params,
 			Subscription: true,
 		}
-		if err := t.server.CheckAuthorization(context.Background(), callContext, false); err != nil {
+		requiresAuthority := t.server.EventRequiresAuthority(call.Path, event)
+		if err := t.server.CheckAuthorization(context.Background(), callContext, requiresAuthority); err != nil {
 			t.answer(source, packet, frame, rpc.ErrorPayload{ID: call.ID, Type: rpc.RPCMessageError, Code: err.Code, Error: err.Err})
 			return
 		}
@@ -553,24 +564,28 @@ func (t *Transport) decodePublish(packet *paho.Publish) (Frame, string, string, 
 	if err != nil {
 		return Frame{}, "", "", err
 	}
+	source := properties[MRSource]
+	contentType := packet.Properties.ContentType
+	if contentType != "" && !t.supportedContentType(contentType) {
+		return Frame{}, source, "", fmt.Errorf("unsupported content type %q", contentType)
+	}
 	if t.options.Verifier != nil {
 		if err := t.verifyPublish(context.Background(), packet, properties); err != nil {
-			return Frame{}, "", "", err
+			return Frame{}, source, "", err
 		}
 	}
-	contentType := packet.Properties.ContentType
 	if contentType == "" {
 		contentType = t.codec.ContentType()
 	}
 	body, err := t.decodeBody(contentType, packet.Payload)
 	if err != nil {
-		return Frame{}, "", "", err
+		return Frame{}, source, "", err
 	}
 	frame, ok := FrameFromControlProperties(properties, body, string(packet.Properties.CorrelationData))
 	if !ok {
-		return Frame{}, "", "", errors.New("invalid control properties")
+		return Frame{}, source, "", errors.New("invalid control properties")
 	}
-	return frame, properties[MRSource], contentType, nil
+	return frame, source, contentType, nil
 }
 
 func (t *Transport) verifyPublish(ctx context.Context, packet *paho.Publish, properties map[string]string) error {
@@ -646,6 +661,13 @@ func (t *Transport) decodeBody(contentType string, payload []byte) (any, error) 
 	return nil, fmt.Errorf("unsupported content type %q", contentType)
 }
 
+func (t *Transport) supportedContentType(contentType string) bool {
+	return contentType == "" ||
+		contentType == t.codec.ContentType() ||
+		contentType == (rpc.JSONCodec{}).ContentType() ||
+		contentType == (rpc.MsgPackCodec{}).ContentType()
+}
+
 func (t *Transport) encodeBody(contentType string, body any) ([]byte, error) {
 	if contentType == "" || contentType == t.codec.ContentType() {
 		return t.codec.Encode(body)
@@ -694,6 +716,22 @@ func (t *Transport) failPending(err error) {
 	for _, wait := range pending {
 		wait <- response{err: err}
 	}
+}
+
+func (t *Transport) reject(packet *paho.Publish, source string, reason string, err error) {
+	if t.options.OnRejected == nil {
+		return
+	}
+	topic := ""
+	if packet != nil {
+		topic = packet.Topic
+	}
+	t.options.OnRejected(RejectedFrame{
+		Source: source,
+		Topic:  topic,
+		Reason: reason,
+		Err:    err,
+	})
 }
 
 func payloadFormat(contentType string) *byte {
@@ -748,6 +786,18 @@ func controlProperties(properties paho.UserProperties) (map[string]string, error
 		values[property.Key] = property.Value
 	}
 	return values, nil
+}
+
+func sourceFromPublish(packet *paho.Publish) string {
+	if packet == nil || packet.Properties == nil {
+		return ""
+	}
+	for _, property := range packet.Properties.User {
+		if property.Key == MRSource {
+			return property.Value
+		}
+	}
+	return ""
 }
 
 func brokerAddress(raw string) (string, error) {

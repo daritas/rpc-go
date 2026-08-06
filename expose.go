@@ -78,6 +78,26 @@ func Event(name string, params ...TypeNode) EventDescription {
 	return EventDescription{Name: name, Params: params}
 }
 
+func EventRequiresAuthority(required bool) EventOption {
+	return func(description *EventDescription) {
+		description.RequiresAuthority = required
+	}
+}
+
+func DescribeEvent(name string, options ...EventOption) EventDescription {
+	description := EventDescription{Name: name}
+	for _, option := range options {
+		option(&description)
+	}
+	return description
+}
+
+func EventParams(params ...TypeNode) EventOption {
+	return func(description *EventDescription) {
+		description.Params = params
+	}
+}
+
 type MethodBinding struct {
 	GoName   string
 	Handler  Handler

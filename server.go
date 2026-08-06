@@ -98,27 +98,29 @@ func (s *Server) ExposeService(namespace string, receiver any, options ...Servic
 	}
 	s.SetNamespace(namespace, service.Namespace)
 	if len(service.Methods) == 0 {
-		if receiver == nil {
-			return nil
-		}
-		return s.Expose(namespace, receiver)
-	}
-	value := reflect.ValueOf(receiver)
-	for _, binding := range service.Methods {
-		description := describeMethod(binding.GoName, binding.Options)
-		handler := binding.Handler
-		if handler == nil && binding.Function != nil {
-			handler = handlerFromFunction(binding.Function, binding.GoName)
-		}
-		if handler == nil {
-			method := value.MethodByName(binding.GoName)
-			if !method.IsValid() {
-				return fmt.Errorf("expose service %s: %s is not a method on %T", namespace, binding.GoName, receiver)
+		if receiver != nil {
+			if err := s.Expose(namespace, receiver); err != nil {
+				return err
 			}
-			handler = reflectedHandler(method, binding.GoName)
 		}
-		s.ExposeFunc(namespace, description.Name, handler)
-		s.DescribeMethod(namespace, description)
+	} else {
+		value := reflect.ValueOf(receiver)
+		for _, binding := range service.Methods {
+			description := describeMethod(binding.GoName, binding.Options)
+			handler := binding.Handler
+			if handler == nil && binding.Function != nil {
+				handler = handlerFromFunction(binding.Function, binding.GoName)
+			}
+			if handler == nil {
+				method := value.MethodByName(binding.GoName)
+				if !method.IsValid() {
+					return fmt.Errorf("expose service %s: %s is not a method on %T", namespace, binding.GoName, receiver)
+				}
+				handler = reflectedHandler(method, binding.GoName)
+			}
+			s.ExposeFunc(namespace, description.Name, handler)
+			s.DescribeMethod(namespace, description)
+		}
 	}
 	for _, event := range service.Events {
 		s.DescribeEvent(namespace, event)
@@ -174,8 +176,16 @@ func (s *Server) Semantics(namespace, method string) (MethodSemantics, bool) {
 }
 
 func (s *Server) Describe() ServerDescription {
-	namespaces := make([]string, 0, len(s.methods))
+	seen := map[string]struct{}{}
+	namespaces := make([]string, 0, len(s.methods)+len(s.events))
 	for namespace := range s.methods {
+		seen[namespace] = struct{}{}
+		namespaces = append(namespaces, namespace)
+	}
+	for namespace := range s.events {
+		if _, ok := seen[namespace]; ok {
+			continue
+		}
 		namespaces = append(namespaces, namespace)
 	}
 	sort.Strings(namespaces)
@@ -346,6 +356,11 @@ func (s *Server) checkAuthorization(ctx context.Context, callContext CallContext
 
 func (s *Server) requiresAuthority(namespace, method string) bool {
 	description := s.described[namespace][method]
+	return description.RequiresAuthority
+}
+
+func (s *Server) EventRequiresAuthority(namespace, event string) bool {
+	description := s.events[namespace][event]
 	return description.RequiresAuthority
 }
 

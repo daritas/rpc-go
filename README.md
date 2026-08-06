@@ -76,3 +76,7 @@ idempotency key, timestamp, nonce and raw payload bytes. A verifier also enables
 Verified MQTT identities are available to handlers through `rpc.CallContextFromContext(ctx)`. Mark a
 method with `rpc.RequiresAuthority(true)` to require an authenticated identity, and use
 `server.UseAuthorizer` for application-specific allow/deny decisions.
+
+Use `mqtt.TransportOptions.OnRejected` to observe dropped MQTT frames, including unsigned, badly
+signed, replayed, malformed and unsupported-content-type frames. Events can also be marked with
+`RequiresAuthority` in their `EventDescription`; unauthorized subscription attempts are refused.

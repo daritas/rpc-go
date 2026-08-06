@@ -3,6 +3,7 @@ package mqtt
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -105,8 +106,10 @@ func TestReplayGuardRejectsReplayAndStaleFrames(t *testing.T) {
 }
 
 func TestVerifierRejectsUnsignedMQTTV5Frame(t *testing.T) {
+	rejected := make(chan RejectedFrame, 1)
 	transport := NewTransport(TransportOptions{
-		Verifier: NewHMACVerifier(map[string]string{"hmi": "hmi-secret"}),
+		Verifier:   NewHMACVerifier(map[string]string{"hmi": "hmi-secret"}),
+		OnRejected: func(frame RejectedFrame) { rejected <- frame },
 	})
 	packet := &paho.Publish{
 		Topic:   "msgrpc/v2/req/plant",
@@ -128,5 +131,141 @@ func TestVerifierRejectsUnsignedMQTTV5Frame(t *testing.T) {
 	}
 	if err := transport.verifyPublish(context.Background(), packet, properties); err == nil {
 		t.Fatal("unsigned frame was accepted")
+	}
+	if _, err := transport.onPublish(paho.PublishReceived{Packet: packet}); err != nil {
+		t.Fatal(err)
+	}
+	got := <-rejected
+	if got.Source != "hmi" || got.Topic != packet.Topic || got.Reason != "unsigned" {
+		t.Fatalf("rejected = %#v, want unsigned hmi frame", got)
+	}
+}
+
+func TestTransportReportsRejectedReplay(t *testing.T) {
+	rejected := make(chan RejectedFrame, 1)
+	transport := NewTransport(TransportOptions{
+		Verifier:   NewHMACVerifier(map[string]string{"hmi": "hmi-secret"}),
+		OnRejected: func(frame RejectedFrame) { rejected <- frame },
+	})
+	packet := signedTestPublish(t, "hmi-secret")
+	if _, err := transport.onPublish(paho.PublishReceived{Packet: packet}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.onPublish(paho.PublishReceived{Packet: packet}); err != nil {
+		t.Fatal(err)
+	}
+	got := <-rejected
+	if got.Source != "hmi" || got.Reason != "stale or replayed" {
+		t.Fatalf("rejected = %#v, want replay rejection", got)
+	}
+}
+
+func TestTransportReportsDuplicateControlProperty(t *testing.T) {
+	rejected := make(chan RejectedFrame, 1)
+	transport := NewTransport(TransportOptions{
+		OnRejected: func(frame RejectedFrame) { rejected <- frame },
+	})
+	properties := userProperties(map[string]string{
+		MRVersion: FrameVersion,
+		MRSource:  "hmi",
+		MRKind:    string(KindCall),
+		MRPath:    "plant",
+		MRMethod:  "write",
+	})
+	properties.Add(MRKind, string(KindCall))
+	packet := &paho.Publish{
+		Topic:   "msgrpc/v2/req/plant",
+		Payload: []byte("[]"),
+		Properties: &paho.PublishProperties{
+			ContentType: (rpc.JSONCodec{}).ContentType(),
+			User:        properties,
+		},
+	}
+	if _, err := transport.onPublish(paho.PublishReceived{Packet: packet}); err != nil {
+		t.Fatal(err)
+	}
+	got := <-rejected
+	if got.Source != "hmi" || got.Reason != "duplicate control property "+MRKind {
+		t.Fatalf("rejected = %#v, want duplicate property rejection", got)
+	}
+}
+
+func TestTransportReportsUnsupportedContentTypeBeforeDecode(t *testing.T) {
+	rejected := make(chan RejectedFrame, 1)
+	transport := NewTransport(TransportOptions{
+		OnRejected: func(frame RejectedFrame) { rejected <- frame },
+	})
+	packet := &paho.Publish{
+		Topic:   "msgrpc/v2/req/plant",
+		Payload: []byte("[]"),
+		Properties: &paho.PublishProperties{
+			ContentType: "application/octet-stream",
+			User: userProperties(map[string]string{
+				MRVersion: FrameVersion,
+				MRSource:  "hmi",
+				MRKind:    string(KindCall),
+				MRPath:    "plant",
+				MRMethod:  "write",
+			}),
+		},
+	}
+	if _, err := transport.onPublish(paho.PublishReceived{Packet: packet}); err != nil {
+		t.Fatal(err)
+	}
+	got := <-rejected
+	if got.Source != "hmi" || got.Reason != `unsupported content type "application/octet-stream"` {
+		t.Fatalf("rejected = %#v, want unsupported content type rejection", got)
+	}
+}
+
+func signedTestPublish(t *testing.T, secret string) *paho.Publish {
+	t.Helper()
+	body, err := (rpc.JSONCodec{}).Encode([]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	topic := "msgrpc/v2/req/plant"
+	responseTopic := "msgrpc/v2/rsp/hmi"
+	timestamp := time.Now().UnixMilli()
+	nonce := "test-nonce-" + rpc.NewID()
+	canonical, err := CanonicalSignedBytesV5(SignedFrameV5{
+		Version:       FrameVersion,
+		Topic:         topic,
+		ResponseTopic: responseTopic,
+		Source:        "hmi",
+		Kind:          string(KindCall),
+		Path:          "plant",
+		MethodOrEvent: "write",
+		Correlation:   "request-1",
+		ContentType:   (rpc.JSONCodec{}).ContentType(),
+		Timestamp:     timestamp,
+		Nonce:         nonce,
+		Payload:       body,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := NewHMACSigner(secret).Sign(context.Background(), canonical, SigningContext{Source: "hmi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &paho.Publish{
+		Topic:   topic,
+		Payload: body,
+		Properties: &paho.PublishProperties{
+			ContentType:     (rpc.JSONCodec{}).ContentType(),
+			ResponseTopic:   responseTopic,
+			CorrelationData: []byte("request-1"),
+			User: userProperties(map[string]string{
+				MRVersion:   FrameVersion,
+				MRSource:    "hmi",
+				MRKind:      string(KindCall),
+				MRPath:      "plant",
+				MRMethod:    "write",
+				MRNonce:     nonce,
+				MRTimestamp: strconv.FormatInt(timestamp, 10),
+				MRSignature: signature,
+			}),
+		},
 	}
 }

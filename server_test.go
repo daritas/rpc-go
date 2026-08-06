@@ -103,6 +103,30 @@ func TestServerDescribesExposedMethods(t *testing.T) {
 	}
 }
 
+func TestServerDescribesProtectedEvents(t *testing.T) {
+	server := NewServer("plantServer")
+	if err := server.ExposeService("calculator", nil,
+		WithNamespace(NamespaceEmitter(true)),
+		WithEvents(DescribeEvent("changed", EventParams(TypeNumber()), EventRequiresAuthority(true))),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	description := server.Describe()
+	var calculator NamespaceDescription
+	for _, namespace := range description.Namespaces {
+		if namespace.Name == "calculator" {
+			calculator = namespace
+		}
+	}
+	if len(calculator.Events) != 1 {
+		t.Fatalf("events = %#v, want one event", calculator.Events)
+	}
+	if !calculator.Events[0].RequiresAuthority {
+		t.Fatalf("event = %#v, want RequiresAuthority", calculator.Events[0])
+	}
+}
+
 func TestExposeServiceDispatchesTypedFunction(t *testing.T) {
 	server := NewServer("plantServer")
 	if err := server.ExposeService("calculator", nil,

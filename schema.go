@@ -32,9 +32,10 @@ type MethodDescription struct {
 }
 
 type EventDescription struct {
-	Name        string     `json:"name" msgpack:"name"`
-	Params      []TypeNode `json:"params,omitempty" msgpack:"params,omitempty"`
-	Subscribers int        `json:"subscribers" msgpack:"subscribers"`
+	Name              string     `json:"name" msgpack:"name"`
+	Params            []TypeNode `json:"params,omitempty" msgpack:"params,omitempty"`
+	Subscribers       int        `json:"subscribers" msgpack:"subscribers"`
+	RequiresAuthority bool       `json:"requiresAuthority,omitempty" msgpack:"requiresAuthority,omitempty"`
 }
 
 type NamespaceDescription struct {

@@ -145,6 +145,130 @@ func TestTransportDeliversEvents(t *testing.T) {
 	}
 }
 
+func TestTransportRequiresIdentityForProtectedEventSubscription(t *testing.T) {
+	brokerURL := os.Getenv("MSGRPC_TEST_BROKER")
+	if brokerURL == "" {
+		brokerURL = "mqtt://localhost:1883"
+	}
+	requireBroker(t, tcpAddress(t, brokerURL))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	prefix := "msgrpc/go-test/" + rpc.NewID()
+
+	server := rpc.NewServer("goProtectedEventServer")
+	server.SetNamespace("calculator", rpc.NamespaceOptions{Version: "1", ClassName: "Calculator", Emitter: true})
+	server.DescribeEvent("calculator", rpc.EventDescription{
+		Name:              "changed",
+		Params:            []rpc.TypeNode{rpc.TypeNumber()},
+		RequiresAuthority: true,
+	})
+	serverTransport := NewTransport(TransportOptions{
+		URL:      brokerURL,
+		Name:     "goProtectedEventServer",
+		Prefix:   prefix,
+		Username: os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password: os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+	})
+	serverTransport.AttachServer(server)
+	if err := serverTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer serverTransport.Close(context.Background())
+
+	clientTransport := NewTransport(TransportOptions{
+		URL:      brokerURL,
+		Name:     "goProtectedEventClient",
+		Prefix:   prefix,
+		Username: os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password: os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+	})
+	if err := clientTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer clientTransport.Close(context.Background())
+
+	client := rpc.NewClient("goProtectedEventClient")
+	client.Use(clientTransport)
+	_, err := client.Subscribe(ctx, "goProtectedEventServer", "calculator", "changed", func(rpc.EventPayload) {})
+	if err == nil {
+		t.Fatal("Subscribe returned nil error, want Unauthorized")
+	}
+	rpcErr, ok := err.(*rpc.RPCError)
+	if !ok || rpcErr.Code != rpc.ErrorUnauthorized {
+		t.Fatalf("err = %#v, want Unauthorized RPCError", err)
+	}
+}
+
+func TestTransportAuthorizerCanDenyEventSubscription(t *testing.T) {
+	brokerURL := os.Getenv("MSGRPC_TEST_BROKER")
+	if brokerURL == "" {
+		brokerURL = "mqtt://localhost:1883"
+	}
+	requireBroker(t, tcpAddress(t, brokerURL))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	prefix := "msgrpc/go-test/" + rpc.NewID()
+
+	server := rpc.NewServer("goDeniedEventServer")
+	server.SetNamespace("calculator", rpc.NamespaceOptions{Version: "1", ClassName: "Calculator", Emitter: true})
+	server.DescribeEvent("calculator", rpc.EventDescription{Name: "changed"})
+	sawSubscription := make(chan struct{}, 1)
+	server.UseAuthorizer(func(_ context.Context, callContext rpc.CallContext) (bool, error) {
+		if callContext.Subscription && callContext.InstanceName == "calculator" && callContext.Method == "changed" {
+			select {
+			case sawSubscription <- struct{}{}:
+			default:
+			}
+			return false, nil
+		}
+		return true, nil
+	})
+	serverTransport := NewTransport(TransportOptions{
+		URL:      brokerURL,
+		Name:     "goDeniedEventServer",
+		Prefix:   prefix,
+		Username: os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password: os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+	})
+	serverTransport.AttachServer(server)
+	if err := serverTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer serverTransport.Close(context.Background())
+
+	clientTransport := NewTransport(TransportOptions{
+		URL:      brokerURL,
+		Name:     "goDeniedEventClient",
+		Prefix:   prefix,
+		Username: os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password: os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+	})
+	if err := clientTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer clientTransport.Close(context.Background())
+
+	client := rpc.NewClient("goDeniedEventClient")
+	client.Use(clientTransport)
+	_, err := client.Subscribe(ctx, "goDeniedEventServer", "calculator", "changed", func(rpc.EventPayload) {})
+	if err == nil {
+		t.Fatal("Subscribe returned nil error, want Forbidden")
+	}
+	rpcErr, ok := err.(*rpc.RPCError)
+	if !ok || rpcErr.Code != rpc.ErrorForbidden {
+		t.Fatalf("err = %#v, want Forbidden RPCError", err)
+	}
+	select {
+	case <-sawSubscription:
+	default:
+		t.Fatal("authorizer did not see subscription context")
+	}
+}
+
 func TestTransportSignedCallAgainstBroker(t *testing.T) {
 	brokerURL := os.Getenv("MSGRPC_TEST_BROKER")
 	if brokerURL == "" {
