@@ -317,6 +317,88 @@ func TestServerDropsInProgressDuplicate(t *testing.T) {
 	}
 }
 
+func TestServerRequiresIdentityForAuthorityProtectedMethod(t *testing.T) {
+	server := NewServer("plantServer")
+	ran := false
+	server.ExposeMethod("plant", "write", func(context.Context, []any) (any, error) {
+		ran = true
+		return "ok", nil
+	}, RequiresAuthority(true))
+
+	reply := server.Dispatch(context.Background(), "hmi", CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "plant",
+		Method: "write",
+	})
+	failure, ok := reply.(ErrorPayload)
+	if !ok {
+		t.Fatalf("reply = %T, want ErrorPayload", reply)
+	}
+	if failure.Code != ErrorUnauthorized {
+		t.Fatalf("code = %s, want %s", failure.Code, ErrorUnauthorized)
+	}
+	if ran {
+		t.Fatal("handler ran without an authenticated identity")
+	}
+}
+
+func TestServerPassesCallContextToHandler(t *testing.T) {
+	server := NewServer("plantServer")
+	server.ExposeMethod("plant", "write", func(ctx context.Context, _ []any) (any, error) {
+		callContext, ok := CallContextFromContext(ctx)
+		if !ok {
+			t.Fatal("missing call context")
+		}
+		if callContext.Source != "hmi" {
+			t.Fatalf("source = %s, want hmi", callContext.Source)
+		}
+		if callContext.Identity == nil || callContext.Identity.Name != "hmi" {
+			t.Fatalf("identity = %#v, want hmi", callContext.Identity)
+		}
+		return callContext.Identity.Name, nil
+	}, RequiresAuthority(true))
+
+	reply := server.DispatchWithIdentity(context.Background(), "hmi", &Identity{Name: "hmi"}, CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "plant",
+		Method: "write",
+	})
+	success, ok := reply.(SuccessPayload)
+	if !ok {
+		t.Fatalf("reply = %T, want SuccessPayload", reply)
+	}
+	if success.Result != "hmi" {
+		t.Fatalf("result = %#v, want hmi", success.Result)
+	}
+}
+
+func TestServerAuthorizerCanDenyCalls(t *testing.T) {
+	server := NewServer("plantServer")
+	server.UseAuthorizer(func(context.Context, CallContext) (bool, error) {
+		return false, nil
+	})
+	server.ExposeMethod("plant", "write", func(context.Context, []any) (any, error) {
+		t.Fatal("handler ran after authorizer denied the call")
+		return nil, nil
+	})
+
+	reply := server.DispatchWithIdentity(context.Background(), "hmi", &Identity{Name: "hmi"}, CallPayload{
+		ID:     "request-1",
+		Type:   RPCMessageCall,
+		Path:   "plant",
+		Method: "write",
+	})
+	failure, ok := reply.(ErrorPayload)
+	if !ok {
+		t.Fatalf("reply = %T, want ErrorPayload", reply)
+	}
+	if failure.Code != ErrorForbidden {
+		t.Fatalf("code = %s, want %s", failure.Code, ErrorForbidden)
+	}
+}
+
 type recordingStore struct {
 	begun    int
 	decision IdempotencyDecision

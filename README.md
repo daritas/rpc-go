@@ -68,3 +68,7 @@ Configure `mqtt.TransportOptions.Signer` and `Verifier` to require signed MQTT 5
 `mqtt.NewHMACSigner` and `mqtt.NewHMACVerifier` implement the same canonical v2 signing input as the
 TypeScript package, including topic, response topic, content type, error code, contract version, TTL,
 idempotency key, timestamp, nonce and raw payload bytes. A verifier also enables replay protection.
+
+Verified MQTT identities are available to handlers through `rpc.CallContextFromContext(ctx)`. Mark a
+method with `rpc.RequiresAuthority(true)` to require an authenticated identity, and use
+`server.UseAuthorizer` for application-specific allow/deny decisions.

@@ -365,15 +365,16 @@ func (t *Transport) answerRequest(source string, packet *paho.Publish, frame Fra
 	if !ok {
 		return
 	}
+	identity, _ := t.Identity(source)
 	if frame.Kind == KindSubscribe || frame.Kind == KindUnsubscribe {
-		t.answerSubscription(source, packet, frame, call)
+		t.answerSubscription(source, identity, packet, frame, call)
 		return
 	}
-	reply := t.server.Dispatch(context.Background(), source, call)
+	reply := t.server.DispatchWithIdentity(context.Background(), source, identity, call)
 	t.answer(source, packet, frame, reply)
 }
 
-func (t *Transport) answerSubscription(source string, packet *paho.Publish, frame Frame, call rpc.CallPayload) {
+func (t *Transport) answerSubscription(source string, identity *rpc.Identity, packet *paho.Publish, frame Frame, call rpc.CallPayload) {
 	if len(call.Params) < 1 {
 		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorInvalidParams, call.Path+"."+call.Method+" expects an event name"))
 		return
@@ -386,6 +387,20 @@ func (t *Transport) answerSubscription(source string, packet *paho.Publish, fram
 	if t.server != nil && !t.server.HasEvent(call.Path, event) {
 		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorMethodNotFound, call.Path+"."+event+" is not a described event"))
 		return
+	}
+	if t.server != nil {
+		callContext := rpc.CallContext{
+			Source:       source,
+			Identity:     identity,
+			InstanceName: call.Path,
+			Method:       event,
+			Params:       call.Params,
+			Subscription: true,
+		}
+		if err := t.server.CheckAuthorization(context.Background(), callContext, false); err != nil {
+			t.answer(source, packet, frame, rpc.ErrorPayload{ID: call.ID, Type: rpc.RPCMessageError, Code: err.Code, Error: err.Err})
+			return
+		}
 	}
 	key := serverEventKey(call.Path, event)
 	t.mu.Lock()

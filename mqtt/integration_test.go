@@ -162,9 +162,13 @@ func TestTransportSignedCallAgainstBroker(t *testing.T) {
 	}
 
 	server := rpc.NewServer("goSignedServer")
-	if err := server.Expose("calculator", integrationCalculator{}); err != nil {
-		t.Fatal(err)
-	}
+	server.ExposeFunction("auth", "who", func(ctx context.Context) (string, error) {
+		callContext, ok := rpc.CallContextFromContext(ctx)
+		if !ok || callContext.Identity == nil {
+			return "", &rpc.RPCError{Code: rpc.ErrorUnauthorized, Err: &rpc.RemoteError{Name: "RpcError", Message: "missing identity"}}
+		}
+		return callContext.Identity.Name, nil
+	}, rpc.RequiresAuthority(true))
 	serverVerifier := NewHMACVerifier(secrets)
 	serverTransport := NewTransport(TransportOptions{
 		URL:             brokerURL,
@@ -200,12 +204,12 @@ func TestTransportSignedCallAgainstBroker(t *testing.T) {
 	client := rpc.NewClient("goSignedClient")
 	client.Use(clientTransport)
 
-	var result int
-	if err := client.Call(ctx, "goSignedServer", "calculator", "Add", []any{2, 3}, &result); err != nil {
+	var result string
+	if err := client.Call(ctx, "goSignedServer", "auth", "who", nil, &result); err != nil {
 		t.Fatal(err)
 	}
-	if result != 5 {
-		t.Fatalf("result = %d, want 5", result)
+	if result != "goSignedClient" {
+		t.Fatalf("result = %s, want goSignedClient", result)
 	}
 	identity, ok := serverTransport.Identity("goSignedClient")
 	if !ok || identity.Name != "goSignedClient" {

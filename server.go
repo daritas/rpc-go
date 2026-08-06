@@ -22,6 +22,7 @@ type Server struct {
 	receivedAt func() time.Time
 
 	idempotency IdempotencyStore
+	authorizer  Authorizer
 }
 
 func NewServer(name string) *Server {
@@ -53,6 +54,10 @@ func (s *Server) Name() string {
 
 func (s *Server) UseIdempotency(store IdempotencyStore) {
 	s.idempotency = store
+}
+
+func (s *Server) UseAuthorizer(authorizer Authorizer) {
+	s.authorizer = authorizer
 }
 
 func (s *Server) ExposeFunc(namespace, method string, handler Handler) {
@@ -243,10 +248,22 @@ func (s *Server) Expose(namespace string, receiver any) error {
 
 func (s *Server) Dispatch(ctx context.Context, source string, call CallPayload) any {
 	arrived := s.receivedAt()
-	return s.DispatchArrived(ctx, source, call, arrived)
+	return s.DispatchArrivedWithIdentity(ctx, source, nil, call, arrived)
+}
+
+func (s *Server) DispatchWithIdentity(ctx context.Context, source string, identity *Identity, call CallPayload) any {
+	arrived := s.receivedAt()
+	return s.DispatchArrivedWithIdentity(ctx, source, identity, call, arrived)
 }
 
 func (s *Server) DispatchArrived(ctx context.Context, source string, call CallPayload, arrived time.Time) any {
+	return s.DispatchArrivedWithIdentity(ctx, source, nil, call, arrived)
+}
+
+func (s *Server) DispatchArrivedWithIdentity(ctx context.Context, source string, identity *Identity, call CallPayload, arrived time.Time) any {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if call.Type != "" && call.Type != RPCMessageCall {
 		return NewErrorPayload(call.ID, ErrorInvalidParams, "payload is not a call")
 	}
@@ -261,6 +278,17 @@ func (s *Server) DispatchArrived(ctx context.Context, source string, call CallPa
 	if handler == nil {
 		return NewErrorPayload(call.ID, ErrorMethodNotFound, fmt.Sprintf("%s.%s is not exposed", call.Path, call.Method))
 	}
+	callContext := CallContext{
+		Source:       source,
+		Identity:     identity,
+		InstanceName: call.Path,
+		Method:       call.Method,
+		Params:       call.Params,
+	}
+	if err := s.checkAuthorization(ctx, callContext, s.requiresAuthority(call.Path, call.Method)); err != nil {
+		return ErrorPayload{ID: call.ID, Type: RPCMessageError, Code: err.Code, Error: err.Err}
+	}
+	ctx = ContextWithCallContext(ctx, callContext)
 	invocation, hasInvocation := s.invocationFor(call, source)
 	claimed := false
 	if hasInvocation {
@@ -293,6 +321,32 @@ func (s *Server) DispatchArrived(ctx context.Context, source string, call CallPa
 	}
 	s.completeIdempotency(ctx, invocation, claimed, StoredOutcome{Result: result})
 	return NewSuccessPayload(call.ID, result)
+}
+
+func (s *Server) CheckAuthorization(ctx context.Context, callContext CallContext, requiresAuthority bool) *RPCError {
+	return s.checkAuthorization(ctx, callContext, requiresAuthority)
+}
+
+func (s *Server) checkAuthorization(ctx context.Context, callContext CallContext, requiresAuthority bool) *RPCError {
+	if requiresAuthority && callContext.Identity == nil {
+		return &RPCError{Code: ErrorUnauthorized, Err: &RemoteError{Name: "RpcError", Message: callContext.InstanceName + "." + callContext.Method + " requires an authenticated peer"}}
+	}
+	if s.authorizer == nil {
+		return nil
+	}
+	allowed, err := s.authorizer(ctx, callContext)
+	if err != nil {
+		return &RPCError{Code: ErrorForbidden, Err: &RemoteError{Name: "RpcError", Message: err.Error()}}
+	}
+	if !allowed {
+		return &RPCError{Code: ErrorForbidden, Err: &RemoteError{Name: "RpcError", Message: callContext.InstanceName + "." + callContext.Method + " is forbidden"}}
+	}
+	return nil
+}
+
+func (s *Server) requiresAuthority(namespace, method string) bool {
+	description := s.described[namespace][method]
+	return description.RequiresAuthority
 }
 
 func (s *Server) invocationFor(call CallPayload, source string) (Invocation, bool) {
