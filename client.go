@@ -18,6 +18,8 @@ type CallOptions struct {
 	OwnerEpoch     string
 }
 
+type EventHandler func(EventPayload)
+
 type Client struct {
 	name      string
 	timeout   time.Duration
@@ -34,6 +36,10 @@ func (c *Client) Name() string {
 
 type Caller interface {
 	Call(ctx context.Context, source string, target string, call CallPayload) (any, error)
+}
+
+type Subscriber interface {
+	Subscribe(ctx context.Context, source string, target string, path string, event string, handler EventHandler) (func(context.Context) error, error)
 }
 
 func (c *Client) Use(transport Caller) {
@@ -63,10 +69,18 @@ func (c *Client) Call(ctx context.Context, target, path, method string, params [
 	return json.Unmarshal(data, result)
 }
 
+func (c *Client) Subscribe(ctx context.Context, target, path, event string, handler EventHandler) (func(context.Context) error, error) {
+	subscriber, ok := c.transport.(Subscriber)
+	if !ok {
+		return nil, &RPCError{Code: ErrorTransport, Err: &RemoteError{Name: "RpcError", Message: "transport does not support subscriptions"}}
+	}
+	return subscriber.Subscribe(ctx, c.name, target, path, event, handler)
+}
+
 func (c *Client) NewCall(path, method string, params []any, options CallOptions) CallPayload {
 	id := options.ID
 	if id == "" {
-		id = randomID()
+		id = NewID()
 	}
 	timeout := options.Timeout
 	if timeout == 0 {
@@ -90,7 +104,7 @@ func (c *Client) NewCall(path, method string, params []any, options CallOptions)
 	return call
 }
 
-func randomID() string {
+func NewID() string {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
 		return time.Now().UTC().Format("20060102150405.000000000")

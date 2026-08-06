@@ -42,9 +42,12 @@ type Transport struct {
 
 	server *rpc.Server
 
-	mu      sync.Mutex
-	pending map[string]chan response
-	closed  bool
+	mu                  sync.Mutex
+	pending             map[string]chan response
+	events              map[string]map[uint64]rpc.EventHandler
+	serverSubscriptions map[string]map[string]struct{}
+	nextSubscriptionID  uint64
+	closed              bool
 }
 
 type response struct {
@@ -69,9 +72,11 @@ func NewTransport(options TransportOptions) *Transport {
 		options.RequestExpirySeconds = defaultRequestExpirySeconds
 	}
 	return &Transport{
-		options: options,
-		codec:   options.Codec,
-		pending: map[string]chan response{},
+		options:             options,
+		codec:               options.Codec,
+		pending:             map[string]chan response{},
+		events:              map[string]map[uint64]rpc.EventHandler{},
+		serverSubscriptions: map[string]map[string]struct{}{},
 	}
 }
 
@@ -221,6 +226,76 @@ func (t *Transport) Call(ctx context.Context, source string, target string, call
 	}
 }
 
+func (t *Transport) Subscribe(ctx context.Context, source string, target string, path string, event string, handler rpc.EventHandler) (func(context.Context) error, error) {
+	if handler == nil {
+		return nil, &rpc.RPCError{Code: rpc.ErrorInvalidParams, Err: &rpc.RemoteError{Name: "RpcError", Message: "event handler is nil"}}
+	}
+	key := clientEventKey(target, path, event)
+	t.mu.Lock()
+	t.nextSubscriptionID++
+	id := t.nextSubscriptionID
+	if t.events[key] == nil {
+		t.events[key] = map[uint64]rpc.EventHandler{}
+	}
+	t.events[key][id] = handler
+	t.mu.Unlock()
+
+	call := rpc.CallPayload{
+		ID:     rpc.NewID(),
+		Type:   rpc.RPCMessageCall,
+		Path:   path,
+		Method: "on",
+		Params: []any{event},
+	}
+	if _, err := t.Call(ctx, source, target, call); err != nil {
+		t.removeEventHandler(key, id)
+		return nil, err
+	}
+	return func(unsubscribeCtx context.Context) error {
+		remaining := t.removeEventHandler(key, id)
+		if remaining {
+			return nil
+		}
+		off := rpc.CallPayload{
+			ID:     rpc.NewID(),
+			Type:   rpc.RPCMessageCall,
+			Path:   path,
+			Method: "off",
+			Params: []any{event},
+		}
+		_, err := t.Call(unsubscribeCtx, source, target, off)
+		return err
+	}, nil
+}
+
+func (t *Transport) PublishEvent(ctx context.Context, path string, event string, params []any) error {
+	key := serverEventKey(path, event)
+	t.mu.Lock()
+	targets := make([]string, 0, len(t.serverSubscriptions[key]))
+	for target := range t.serverSubscriptions[key] {
+		targets = append(targets, target)
+	}
+	t.mu.Unlock()
+	for _, target := range targets {
+		frame, ok := ToFrame(rpc.Message{
+			Type: rpc.MessageTypeEvent,
+			Payload: rpc.EventPayload{
+				Type:   rpc.RPCMessageEvent,
+				Event:  event,
+				Path:   path,
+				Params: params,
+			},
+		})
+		if !ok {
+			return fmt.Errorf("event cannot be represented as an MQTT frame")
+		}
+		if err := t.publishFrame(ctx, t.options.Name, target, frame, t.codec.ContentType()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (t *Transport) subscribe(ctx context.Context) error {
 	subscriptions := []paho.SubscribeOptions{
 		{Topic: Topic(t.options.Prefix, ChannelResponse, t.options.Name), QoS: t.options.QoS},
@@ -264,7 +339,7 @@ func (t *Transport) onPublish(pr paho.PublishReceived) (bool, error) {
 			go t.answerRequest(source, packet, frame, message)
 		}
 	case ChannelEvent:
-		// Event subscriptions will be added after the request/response path is proven.
+		t.deliverEvent(source, message)
 	}
 	_ = contentType
 	return true, nil
@@ -275,7 +350,46 @@ func (t *Transport) answerRequest(source string, packet *paho.Publish, frame Fra
 	if !ok {
 		return
 	}
+	if frame.Kind == KindSubscribe || frame.Kind == KindUnsubscribe {
+		t.answerSubscription(source, packet, frame, call)
+		return
+	}
 	reply := t.server.Dispatch(context.Background(), source, call)
+	t.answer(source, packet, frame, reply)
+}
+
+func (t *Transport) answerSubscription(source string, packet *paho.Publish, frame Frame, call rpc.CallPayload) {
+	if len(call.Params) < 1 {
+		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorInvalidParams, call.Path+"."+call.Method+" expects an event name"))
+		return
+	}
+	event, ok := call.Params[0].(string)
+	if !ok || event == "" {
+		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorInvalidParams, call.Path+"."+call.Method+" expects an event name"))
+		return
+	}
+	if t.server != nil && !t.server.HasEvent(call.Path, event) {
+		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorMethodNotFound, call.Path+"."+event+" is not a described event"))
+		return
+	}
+	key := serverEventKey(call.Path, event)
+	t.mu.Lock()
+	if frame.Kind == KindSubscribe {
+		if t.serverSubscriptions[key] == nil {
+			t.serverSubscriptions[key] = map[string]struct{}{}
+		}
+		t.serverSubscriptions[key][source] = struct{}{}
+	} else {
+		delete(t.serverSubscriptions[key], source)
+		if len(t.serverSubscriptions[key]) == 0 {
+			delete(t.serverSubscriptions, key)
+		}
+	}
+	t.mu.Unlock()
+	t.answer(source, packet, frame, rpc.NewSuccessPayload(call.ID, "ok"))
+}
+
+func (t *Transport) answer(source string, packet *paho.Publish, frame Frame, reply any) {
 	replyFrame, ok := ToFrame(rpc.Message{Payload: reply})
 	if !ok {
 		return
@@ -312,12 +426,29 @@ func (t *Transport) deliverResponse(correlation string, message rpc.Message) {
 	}
 }
 
+func (t *Transport) deliverEvent(source string, message rpc.Message) {
+	payload, ok := message.Payload.(rpc.EventPayload)
+	if !ok {
+		return
+	}
+	key := clientEventKey(source, payload.Path, payload.Event)
+	t.mu.Lock()
+	handlers := make([]rpc.EventHandler, 0, len(t.events[key]))
+	for _, handler := range t.events[key] {
+		handlers = append(handlers, handler)
+	}
+	t.mu.Unlock()
+	for _, handler := range handlers {
+		handler(payload)
+	}
+}
+
 func (t *Transport) publishFrame(ctx context.Context, source string, target string, frame Frame, contentType string) error {
 	return t.publishFrameToTopic(ctx, source, Topic(t.options.Prefix, frame.Channel, target), frame, contentType)
 }
 
 func (t *Transport) publishFrameToTopic(ctx context.Context, source string, topic string, frame Frame, contentType string) error {
-	body, err := t.codec.Encode(frame.Body)
+	body, err := t.encodeBody(contentType, frame.Body)
 	if err != nil {
 		return err
 	}
@@ -325,10 +456,7 @@ func (t *Transport) publishFrameToTopic(ctx context.Context, source string, topi
 		ContentType: contentType,
 		User:        userProperties(frame.ControlProperties(source)),
 	}
-	if contentType == (rpc.JSONCodec{}).ContentType() {
-		payloadFormat := byte(1)
-		properties.PayloadFormat = &payloadFormat
-	}
+	properties.PayloadFormat = payloadFormat(contentType)
 	if frame.Correlation != "" {
 		properties.CorrelationData = []byte(frame.Correlation)
 	}
@@ -382,6 +510,19 @@ func (t *Transport) decodeBody(contentType string, payload []byte) (any, error) 
 	return nil, fmt.Errorf("unsupported content type %q", contentType)
 }
 
+func (t *Transport) encodeBody(contentType string, body any) ([]byte, error) {
+	if contentType == "" || contentType == t.codec.ContentType() {
+		return t.codec.Encode(body)
+	}
+	if contentType == (rpc.JSONCodec{}).ContentType() {
+		return (rpc.JSONCodec{}).Encode(body)
+	}
+	if contentType == (rpc.MsgPackCodec{}).ContentType() {
+		return (rpc.MsgPackCodec{}).Encode(body)
+	}
+	return nil, fmt.Errorf("unsupported content type %q", contentType)
+}
+
 func (t *Transport) publishPresence(ctx context.Context, state string) error {
 	_, err := t.client.Publish(ctx, &paho.Publish{
 		Topic:   PresenceTopic(t.options.Prefix, t.options.Name),
@@ -398,6 +539,17 @@ func (t *Transport) forget(correlation string) {
 	t.mu.Unlock()
 }
 
+func (t *Transport) removeEventHandler(key string, id uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.events[key], id)
+	if len(t.events[key]) == 0 {
+		delete(t.events, key)
+		return false
+	}
+	return true
+}
+
 func (t *Transport) failPending(err error) {
 	t.mu.Lock()
 	pending := t.pending
@@ -406,6 +558,27 @@ func (t *Transport) failPending(err error) {
 	for _, wait := range pending {
 		wait <- response{err: err}
 	}
+}
+
+func payloadFormat(contentType string) *byte {
+	var format byte
+	switch contentType {
+	case (rpc.JSONCodec{}).ContentType():
+		format = 1
+	case (rpc.MsgPackCodec{}).ContentType(), "":
+		format = 0
+	default:
+		return nil
+	}
+	return &format
+}
+
+func clientEventKey(source string, path string, event string) string {
+	return source + "\x00" + path + "\x00" + event
+}
+
+func serverEventKey(path string, event string) string {
+	return path + "\x00" + event
 }
 
 func requestExpiry(ttl int64, fallback uint32) uint32 {

@@ -23,8 +23,12 @@ func main() {
 
 	server := rpc.NewServer(name)
 	server.SetNamespace("calculator", rpc.NamespaceOptions{Version: "1", ClassName: "Calculator"})
+	server.DescribeEvent("calculator", rpc.EventDescription{
+		Name:   "changed",
+		Params: []rpc.TypeNode{rpc.TypeNumber()},
+	})
+	var transport *rpcmqtt.Transport
 	server.ExposeFunc("calculator", "add", func(ctx context.Context, params []any) (any, error) {
-		_ = ctx
 		if len(params) != 2 {
 			return nil, &rpc.RPCError{Code: rpc.ErrorInvalidParams, Err: &rpc.RemoteError{Name: "RpcError", Message: "calculator.add expects two numbers"}}
 		}
@@ -33,7 +37,11 @@ func main() {
 		if !okA || !okB {
 			return nil, &rpc.RPCError{Code: rpc.ErrorInvalidParams, Err: &rpc.RemoteError{Name: "RpcError", Message: "calculator.add expects two numbers"}}
 		}
-		return a + b, nil
+		result := a + b
+		if transport != nil {
+			_ = transport.PublishEvent(ctx, "calculator", "changed", []any{result})
+		}
+		return result, nil
 	})
 	server.DescribeMethod("calculator", rpc.MethodDescription{
 		Name:    "add",
@@ -41,7 +49,7 @@ func main() {
 		Returns: rpc.TypeNumber(),
 	})
 
-	transport := rpcmqtt.NewTransport(rpcmqtt.TransportOptions{
+	transport = rpcmqtt.NewTransport(rpcmqtt.TransportOptions{
 		URL:             broker,
 		Name:            name,
 		PublishPresence: true,

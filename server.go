@@ -18,6 +18,7 @@ type Server struct {
 	semantics  map[string]map[string]MethodSemantics
 	namespaces map[string]NamespaceOptions
 	described  map[string]map[string]MethodDescription
+	events     map[string]map[string]EventDescription
 	receivedAt func() time.Time
 }
 
@@ -28,6 +29,7 @@ func NewServer(name string) *Server {
 		semantics:  map[string]map[string]MethodSemantics{},
 		namespaces: map[string]NamespaceOptions{},
 		described:  map[string]map[string]MethodDescription{},
+		events:     map[string]map[string]EventDescription{},
 		receivedAt: time.Now,
 	}
 	server.ExposeFunc("msgrpc", "describe", func(context.Context, []any) (any, error) {
@@ -77,6 +79,24 @@ func (s *Server) DescribeMethod(namespace string, description MethodDescription)
 	s.described[namespace][description.Name] = description
 }
 
+func (s *Server) DescribeEvent(namespace string, description EventDescription) {
+	if description.Name == "" {
+		return
+	}
+	if s.events[namespace] == nil {
+		s.events[namespace] = map[string]EventDescription{}
+	}
+	s.events[namespace][description.Name] = description
+}
+
+func (s *Server) HasEvent(namespace, event string) bool {
+	if len(s.events[namespace]) == 0 {
+		return false
+	}
+	_, ok := s.events[namespace][event]
+	return ok
+}
+
 func (s *Server) DeclareSemantics(namespace, method string, semantics MethodSemantics) {
 	if s.semantics[namespace] == nil {
 		s.semantics[namespace] = map[string]MethodSemantics{}
@@ -121,6 +141,15 @@ func (s *Server) Describe() ServerDescription {
 			}
 			methods = append(methods, method)
 		}
+		events := make([]EventDescription, 0, len(s.events[namespace]))
+		eventNames := make([]string, 0, len(s.events[namespace]))
+		for name := range s.events[namespace] {
+			eventNames = append(eventNames, name)
+		}
+		sort.Strings(eventNames)
+		for _, name := range eventNames {
+			events = append(events, s.events[namespace][name])
+		}
 		description.Namespaces = append(description.Namespaces, NamespaceDescription{
 			Name:      namespace,
 			Version:   options.Version,
@@ -128,7 +157,7 @@ func (s *Server) Describe() ServerDescription {
 			Created:   false,
 			Emitter:   options.Emitter,
 			Methods:   methods,
-			Events:    []EventDescription{},
+			Events:    events,
 		})
 	}
 	return description

@@ -72,6 +72,79 @@ func TestTransportCallAgainstBroker(t *testing.T) {
 	}
 }
 
+func TestTransportDeliversEvents(t *testing.T) {
+	brokerURL := os.Getenv("MSGRPC_TEST_BROKER")
+	if brokerURL == "" {
+		brokerURL = "mqtt://localhost:1883"
+	}
+	requireBroker(t, tcpAddress(t, brokerURL))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	prefix := "msgrpc/go-test/" + rpc.NewID()
+
+	server := rpc.NewServer("goEventServer")
+	server.SetNamespace("calculator", rpc.NamespaceOptions{Version: "1", ClassName: "Calculator", Emitter: true})
+	server.DescribeEvent("calculator", rpc.EventDescription{
+		Name:   "changed",
+		Params: []rpc.TypeNode{rpc.TypeNumber()},
+	})
+	serverTransport := NewTransport(TransportOptions{
+		URL:             brokerURL,
+		Name:            "goEventServer",
+		Prefix:          prefix,
+		PublishPresence: true,
+		Username:        os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password:        os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+	})
+	serverTransport.AttachServer(server)
+	if err := serverTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer serverTransport.Close(context.Background())
+
+	clientTransport := NewTransport(TransportOptions{
+		URL:             brokerURL,
+		Name:            "goEventClient",
+		Prefix:          prefix,
+		PublishPresence: true,
+		Username:        os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password:        os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+	})
+	if err := clientTransport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer clientTransport.Close(context.Background())
+
+	client := rpc.NewClient("goEventClient")
+	client.Use(clientTransport)
+	received := make(chan rpc.EventPayload, 1)
+	unsubscribe, err := client.Subscribe(ctx, "goEventServer", "calculator", "changed", func(event rpc.EventPayload) {
+		received <- event
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unsubscribe(context.Background())
+
+	if err := serverTransport.PublishEvent(ctx, "calculator", "changed", []any{42}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case event := <-received:
+		if event.Path != "calculator" || event.Event != "changed" {
+			t.Fatalf("event = %#v, want calculator.changed", event)
+		}
+		if len(event.Params) != 1 {
+			t.Fatalf("params = %#v, want one value", event.Params)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
 func TestTransportCallsSourceRPCPeer(t *testing.T) {
 	peer := os.Getenv("MSGRPC_TEST_INTEROP_PEER")
 	if peer == "" {

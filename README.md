@@ -14,6 +14,8 @@ nodes that sit on a broker. WebSocket/socket.io can stay out of the initial surf
   by hand or generated later.
 - MsgPack is the default codec, matching the TypeScript package. JSON is also supported and replies
   mirror the request content type.
+- Event subscriptions use the Source RPC convention: a client sends `on(event)`, the server records
+  that peer as a subscriber, and events are published on `evt/<peer>`.
 
 The first useful compatibility target is the MQTT 5 frame spec in `rpc-ts/docs/mqtt5-frame-spec.md`:
 requests on `req`, responses on `rsp`, events on `evt`, and control fields in `mr-*` user
@@ -59,3 +61,5 @@ instead of a skip.
 
 Set `MSGRPC_TEST_INTEROP_PEER=<peer>` to have the Go client call a live Source RPC peer exposing
 `calculator.add(number, number)`.
+
+`examples/calculator_server` serves `calculator.add` and emits `calculator.changed` with the sum.
