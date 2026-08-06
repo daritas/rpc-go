@@ -1,1 +1,10 @@
 rpc-ts/
+
+# Go build and test artifacts.
+bin/
+dist/
+coverage.out
+*.test
+
+# Local binaries from running examples in-place.
+examples/calculator_server/calculator_server
