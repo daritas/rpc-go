@@ -66,6 +66,46 @@ checkout.
 
 `examples/calculator_server` serves `calculator.add` and emits `calculator.changed` with the sum.
 
+## Remote Go Programs
+
+`package node` exposes a guarded Go program runner for remote nodes. A node can serve the
+`msgrpc.node` namespace with:
+
+```go
+service := node.NewService(node.ServiceOptions{
+    Runner: node.RunnerOptions{Directory: "programs"},
+})
+defer service.Close()
+if err := service.Expose(server); err != nil {
+    log.Fatal(err)
+}
+```
+
+The RPC methods are:
+
+```text
+describeRuntime()
+listPrograms()
+saveProgram(name, source)
+readProgram(name)
+deleteProgram(name)
+buildProgram(name)
+startProgram(name)
+stopProgram(name)
+programStatus(name)
+programOutput(name)
+```
+
+Mutation methods require an authenticated peer. Add `server.UseAuthorizer(node.Authorizer(...))`
+when a node should only accept program changes from named identities.
+
+`examples/program_node` starts an MQTT node that exposes this namespace. Set
+`SOURCE_RPC_PROGRAMS=/path/to/programs` to choose the storage directory and
+`SOURCE_RPC_SHARED_SECRET=...` to enable HMAC signing. Set `SOURCE_RPC_SCRIPTABLE_BY=name1,name2`
+to restrict authenticated peers that can change or run code.
+
+See `docs/go-program-node.md` for the current node API and expected remote workflow.
+
 ## MQTT Signing
 
 Configure `mqtt.TransportOptions.Signer` and `Verifier` to require signed MQTT 5 frames. The built-in

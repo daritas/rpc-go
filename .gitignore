@@ -8,3 +8,7 @@ coverage.out
 
 # Local binaries from running examples in-place.
 examples/calculator_server/calculator_server
+examples/program_node/program_node
+
+# Local storage used by the program-node example.
+programs/
