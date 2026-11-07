@@ -8,9 +8,9 @@ import (
 	"strings"
 	"syscall"
 
-	rpc "github.com/source-repo/rpc-go"
-	rpcmqtt "github.com/source-repo/rpc-go/mqtt"
-	"github.com/source-repo/rpc-go/node"
+	rpc "github.com/daritas/rpc-go"
+	rpcmqtt "github.com/daritas/rpc-go/mqtt"
+	"github.com/daritas/rpc-go/node"
 )
 
 func main() {

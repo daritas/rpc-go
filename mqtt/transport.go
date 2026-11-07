@@ -13,7 +13,7 @@ import (
 
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
-	rpc "github.com/source-repo/rpc-go"
+	rpc "github.com/daritas/rpc-go"
 )
 
 const defaultRequestExpirySeconds uint32 = 30

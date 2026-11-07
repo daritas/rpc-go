@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 
-	rpc "github.com/source-repo/rpc-go"
+	rpc "github.com/daritas/rpc-go"
 )
 
 const (

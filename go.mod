@@ -1,4 +1,4 @@
-module github.com/source-repo/rpc-go
+module github.com/daritas/rpc-go
 
 go 1.24.0
 
