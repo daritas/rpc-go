@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/eclipse/paho.golang/paho"
-	rpc "github.com/source-repo/rpc-go"
+	rpc "github.com/daritas/rpc-go"
 )
 
 func TestHMACSigningVerifiesCanonicalMQTTV5Frame(t *testing.T) {

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	rpc "github.com/source-repo/rpc-go"
+	rpc "github.com/daritas/rpc-go"
 )
 
 type ServiceOptions struct {

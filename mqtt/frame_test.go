@@ -3,7 +3,7 @@ package mqtt
 import (
 	"testing"
 
-	rpc "github.com/source-repo/rpc-go"
+	rpc "github.com/daritas/rpc-go"
 )
 
 func TestCallToFrame(t *testing.T) {

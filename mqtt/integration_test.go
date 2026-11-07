@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	rpc "github.com/source-repo/rpc-go"
+	rpc "github.com/daritas/rpc-go"
 )
 
 type integrationCalculator struct{}

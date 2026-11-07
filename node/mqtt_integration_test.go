@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	rpc "github.com/source-repo/rpc-go"
-	rpcmqtt "github.com/source-repo/rpc-go/mqtt"
+	rpc "github.com/daritas/rpc-go"
+	rpcmqtt "github.com/daritas/rpc-go/mqtt"
 )
 
 func TestServiceRunsProgramOverSignedMQTTBroker(t *testing.T) {

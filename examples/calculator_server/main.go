@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	rpc "github.com/source-repo/rpc-go"
-	rpcmqtt "github.com/source-repo/rpc-go/mqtt"
+	rpc "github.com/daritas/rpc-go"
+	rpcmqtt "github.com/daritas/rpc-go/mqtt"
 )
 
 func main() {
