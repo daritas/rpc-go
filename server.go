@@ -277,8 +277,8 @@ func (s *Server) DispatchArrivedWithIdentity(ctx context.Context, source string,
 	if call.Type != "" && call.Type != RPCMessageCall {
 		return NewErrorPayload(call.ID, ErrorInvalidParams, "payload is not a call")
 	}
-	if call.TTL > 0 && time.Since(arrived) > time.Duration(call.TTL)*time.Millisecond {
-		return NewErrorPayload(call.ID, ErrorTimeout, fmt.Sprintf("%s.%s was not run: its caller stopped waiting", call.Path, call.Method))
+	if expired(call, arrived) {
+		return NewErrorPayload(call.ID, ErrorTimeout, stoppedWaiting(call))
 	}
 	namespace := s.methods[call.Path]
 	if namespace == nil {
@@ -316,6 +316,14 @@ func (s *Server) DispatchArrivedWithIdentity(ctx context.Context, source string,
 		default:
 			return NewErrorPayload(call.ID, ErrorUnknownOutcome, fmt.Sprintf("%s.%s was not run: its idempotency store returned an unknown decision", call.Path, call.Method))
 		}
+	}
+	// Tested again here, not only on arrival. The frame spec asks for the budget to be checked
+	// immediately before the method runs, and between the two checks sit an authorizer and an
+	// idempotency store that may both reach the network. A claim taken above is released on the way
+	// out, or a command that was merely late could never be retried.
+	if expired(call, arrived) {
+		s.abandonIdempotency(ctx, invocation, claimed)
+		return NewErrorPayload(call.ID, ErrorTimeout, stoppedWaiting(call))
 	}
 	result, err := handler(ctx, call.Params)
 	if err != nil {
@@ -390,6 +398,32 @@ func (s *Server) completeIdempotency(ctx context.Context, invocation Invocation,
 		return
 	}
 	_ = s.idempotency.Complete(ctx, invocation, outcome)
+}
+
+// abandonIdempotency releases a claim on a command that will not run after all, so that a caller
+// which retries is not told the attempt is still in progress by a claim nobody will ever complete.
+//
+// Detached from the incoming context on purpose: the usual reason to abandon is that the deadline
+// on that context has passed, and a store reached over the network would refuse the release too.
+func (s *Server) abandonIdempotency(ctx context.Context, invocation Invocation, claimed bool) {
+	if !claimed || s.idempotency == nil {
+		return
+	}
+	abandoner, ok := s.idempotency.(IdempotencyAbandoner)
+	if !ok {
+		return
+	}
+	_ = abandoner.Abandon(context.WithoutCancel(ctx), invocation)
+}
+
+// expired reports whether the caller's stated budget ran out before now. `arrived` is when the
+// request reached this peer, which for an MQTT frame already has the broker's queueing deducted.
+func expired(call CallPayload, arrived time.Time) bool {
+	return call.TTL > 0 && time.Since(arrived) > time.Duration(call.TTL)*time.Millisecond
+}
+
+func stoppedWaiting(call CallPayload) string {
+	return fmt.Sprintf("%s.%s was not run: its caller stopped waiting", call.Path, call.Method)
 }
 
 func reflectedHandler(method reflect.Value, name string) Handler {

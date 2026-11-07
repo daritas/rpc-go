@@ -44,6 +44,111 @@ msgrpc/v2/req/plantServer
   mr-method=ReadSetpoint
 ```
 
+## Securing A Link
+
+Three mechanisms, answering three different questions. They compose; none replaces another.
+
+| mechanism | answers | where it belongs |
+| --- | --- | --- |
+| broker ACLs | may this peer publish or subscribe here? | inside one trust domain, always |
+| TLS | can anyone on the path read or rewrite this? | any link leaving the host or the plant network |
+| frame signing | who wrote this frame, and is it unaltered? | any link crossing a trust boundary |
+
+Signing and TLS are the pair most easily confused. A signature proves authorship and integrity and
+hides nothing: without TLS, every payload, every method name, and the username and password in the
+CONNECT packet are readable by anyone on the path. Conversely TLS says the link reached the broker
+you expected, and says nothing about which peer published a frame the broker then handed you. Where
+signing is warranted, so is TLS.
+
+Reach a broker over TLS with an `mqtts://` URL (port 8883 by default; `tls://` and `ssl://` also
+work). With nothing else configured, the broker is verified against the host's trust store under the
+name in the URL:
+
+```go
+transport := mqtt.NewTransport(mqtt.TransportOptions{
+    Name: "plantServer",
+    URL:  "mqtts://broker.example.com",
+})
+```
+
+For a plant running its own certificate authority, or a broker that identifies peers by
+certificate:
+
+```go
+transport := mqtt.NewTransport(mqtt.TransportOptions{
+    Name: "plantServer",
+    URL:  "mqtts://broker.plant.local",
+    TLS: &mqtt.TLSOptions{
+        CAFile:          "/etc/source-rpc/plant-ca.pem",
+        CertificateFile: "/etc/source-rpc/plantServer.pem",
+        KeyFile:         "/etc/source-rpc/plantServer-key.pem",
+    },
+})
+```
+
+`TLSOptions.Config` takes a `*tls.Config` outright for anything the convenience fields do not reach.
+`InsecureSkipVerify` exists for a lab with a self-signed broker; it makes the link worth nothing
+against an attacker on the path, who simply presents their own certificate.
+
+TLS options given alongside a plain `mqtt://` URL are an error rather than being ignored, so a
+misconfiguration cannot leave a peer believing a cleartext link is encrypted.
+
+## Reconnecting
+
+The transport owns its connection: a dropped link is redialled with exponential backoff and every
+subscription is restored, with no work from the caller. `Connect` still reports an initial failure,
+because a peer that cannot start is a configuration problem rather than something to retry over
+silently — and a broker that refuses the client ID or the credentials is reported at once rather
+than retried, since no amount of backoff changes a wrong password.
+
+Calls in flight when a link drops fail with `TransportError` rather than being held for the
+reconnection. `TransportOptions.OnConnection` reports the connection coming up and going down, and
+names any subscriptions the broker refused on the way back — a peer that reconnects into a
+half-working state can then say so instead of going quiet.
+
+## Discovering Peers
+
+Every peer publishes retained presence, so a newcomer subscribing to `<prefix>/presence/+` is handed
+everyone already online. That is the whole of peer discovery on MQTT.
+
+```go
+transport := mqtt.NewTransport(mqtt.TransportOptions{
+    Name:              "hmi",
+    SubscribePresence: true,
+    PublishPresence:   true,
+    OnPresence: func(event mqtt.PresenceEvent) {
+        log.Printf("%s online=%v shape=%s", event.Peer, event.Online, event.Shape)
+    },
+})
+```
+
+`Peers()` is the current list. `PresenceSettled(ctx)` waits until the retained burst has been read,
+which is what makes "no peers found" mean something:
+
+```go
+if err := transport.PresenceSettled(ctx); err != nil {
+    return err
+}
+for _, peer := range transport.Peers() {
+    // ...
+}
+```
+
+The broker delivers everything retained the moment the subscription is granted and there is no "that
+was everyone" packet, so a short silence after the grant is the only end marker MQTT has. The gap is
+armed when the subscribe is acknowledged and restarted by each presence message: an empty network
+settles after one quiet period, a full one after its burst. It is a heuristic with an honest name — a
+broker slower than the gap loses the race, which is what the caller's own context is for.
+
+`Shape` announces a hash of this peer's description beside its retained `online`, so a cache holding
+a `describe()` answer can tell a restart that changed the surface from one that did not. It rides as
+an MQTT 5 user property rather than in the payload, because the payload has to stay the exact string
+every already-deployed peer compares against.
+
+A peer name arrives from the network, is interpolated into the topics this peer publishes to, and is
+used as a map key, so names carrying wildcards, separators or control characters are refused and
+reported through `OnRejected`. The same check applies to `mr-src` on every frame.
+
 ## Testing With A Broker
 
 The MQTT integration test uses `mqtt://localhost:1883` when it is reachable. If the broker requires

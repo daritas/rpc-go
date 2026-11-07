@@ -11,12 +11,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eclipse/paho.golang/packets"
+	"github.com/eclipse/paho.golang/autopaho"
 	"github.com/eclipse/paho.golang/paho"
 	rpc "github.com/daritas/rpc-go"
 )
 
 const defaultRequestExpirySeconds uint32 = 30
+
+// subscribeTimeout bounds one pass of restoring subscriptions after a connection comes up. It is
+// not the caller's deadline: a reconnection happens with nobody waiting on it.
+const subscribeTimeout = 30 * time.Second
 
 type TransportOptions struct {
 	URL                  string
@@ -32,11 +36,37 @@ type TransportOptions struct {
 	SubscribePresence    bool
 	Username             string
 	Password             string
-	Signer               MessageSigner
-	Verifier             MessageVerifier
-	MaxClockSkew         time.Duration
-	MaxTrackedNonces     int
-	OnRejected           func(RejectedFrame)
+
+	// TLS configures the encrypted link, and applies to an mqtts:// broker URL. Left nil against an
+	// mqtts:// URL, the broker is verified against the host's trust store under the name in the URL.
+	TLS *TLSOptions
+
+	Signer           MessageSigner
+	Verifier         MessageVerifier
+	MaxClockSkew     time.Duration
+	MaxTrackedNonces int
+	OnRejected       func(RejectedFrame)
+
+	// AllowResponseTopic replaces the default rule that a request's response topic must sit under
+	// this transport's prefix. An installation that answers across prefixes supplies its own.
+	AllowResponseTopic func(topic string, source string) bool
+
+	// OnConnection reports the broker connection coming up and going down, including which
+	// subscriptions failed to restore. A peer that reconnects into a half-working state should be
+	// able to say so rather than going quiet.
+	OnConnection func(ConnectionEvent)
+
+	// OnPresence reports a peer arriving or leaving, for a caller that wants the changes rather
+	// than to poll Peers(). Needs SubscribePresence.
+	OnPresence func(PresenceEvent)
+
+	// Shape is this peer's description hash, announced beside its retained presence so a cache
+	// holding a describe() answer can tell a restart that changed the surface from one that did not.
+	Shape string
+
+	// ReconnectBackoff decides how long to wait after failed connection attempt N. Defaults to an
+	// exponential backoff between one second and a minute.
+	ReconnectBackoff func(attempt int) time.Duration
 }
 
 type RejectedFrame struct {
@@ -46,10 +76,22 @@ type RejectedFrame struct {
 	Err    error
 }
 
+// ConnectionEvent describes a change in the broker connection.
+type ConnectionEvent struct {
+	// Up is true when a connection was established, false when one was lost.
+	Up bool
+	// First is true for the initial connection and false for every reconnection after it.
+	First bool
+	// FailedSubscriptions names the topics the broker refused on reconnect. A non-empty list means
+	// this peer is connected but not serving everything it was serving before.
+	FailedSubscriptions []string
+	// Err carries why a connection dropped, or why restoring subscriptions failed.
+	Err error
+}
+
 type Transport struct {
 	options TransportOptions
-	client  *paho.Client
-	conn    net.Conn
+	manager *autopaho.ConnectionManager
 	codec   rpc.Codec
 
 	server *rpc.Server
@@ -62,6 +104,25 @@ type Transport struct {
 	replayGuard         *ReplayGuard
 	nextSubscriptionID  uint64
 	closed              bool
+	connected           bool
+	lastConnectErr      error
+
+	// ready is closed once the first connection has finished subscribing, which is what Connect
+	// waits for. Reconnections after that are the connection manager's business, not the caller's.
+	ready     chan struct{}
+	readyOnce sync.Once
+
+	// refused is closed when the broker denies this peer's identity, which no amount of retrying
+	// will fix and which Connect should therefore report without waiting out its window.
+	refused     chan struct{}
+	refusedOnce sync.Once
+
+	// peers is what presence has reported, and settled closes once the retained burst that fills it
+	// has been read. sweepTimer measures the quiet period that decides when that is.
+	peers       map[string]Peer
+	settled     chan struct{}
+	settledOnce sync.Once
+	sweepTimer  *time.Timer
 }
 
 type response struct {
@@ -93,6 +154,10 @@ func NewTransport(options TransportOptions) *Transport {
 		serverSubscriptions: map[string]map[string]struct{}{},
 		peerIdentities:      map[string]*rpc.Identity{},
 		replayGuard:         NewReplayGuard(options.MaxClockSkew, options.MaxTrackedNonces),
+		ready:               make(chan struct{}),
+		refused:             make(chan struct{}),
+		peers:               map[string]Peer{},
+		settled:             make(chan struct{}),
 	}
 }
 
@@ -107,80 +172,215 @@ func (t *Transport) Identity(source string) (*rpc.Identity, bool) {
 	return identity, ok
 }
 
+// Connect establishes the broker connection and waits for the first subscription pass to finish.
+//
+// The connection is managed from here on: a dropped link is redialled with backoff and every
+// subscription is restored, without the caller doing anything. Connect still reports an initial
+// failure — an unreachable broker or refused credentials — because a peer that cannot start is a
+// configuration problem for whoever started it, not something to retry over silently.
 func (t *Transport) Connect(ctx context.Context) error {
 	if t.options.Name == "" {
 		return errors.New("mqtt transport: Name is required")
 	}
-	address, err := brokerAddress(t.options.URL)
+	serverURL, err := brokerURL(t.options.URL)
 	if err != nil {
 		return err
 	}
-	dialer := &net.Dialer{}
-	dialCtx := ctx
-	var cancel context.CancelFunc
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline && t.options.ConnectTimeout > 0 {
-		dialCtx, cancel = context.WithTimeout(ctx, t.options.ConnectTimeout)
-		defer cancel()
-	}
-	conn, err := dialer.DialContext(dialCtx, "tcp", address)
-	if err != nil {
-		return fmt.Errorf("mqtt transport: dial %s: %w", address, err)
-	}
-	t.conn = conn
-	t.client = paho.NewClient(paho.ClientConfig{
-		ClientID: t.options.Name,
-		Conn:     packets.NewThreadSafeConn(conn),
-		OnPublishReceived: []func(paho.PublishReceived) (bool, error){
-			t.onPublish,
-		},
-		OnClientError: func(err error) {
-			t.failPending(&rpc.RPCError{Code: rpc.ErrorTransport, Err: &rpc.RemoteError{Name: "RpcError", Message: err.Error()}})
-		},
-	})
 
-	cleanStart := !t.options.PersistentSession
-	connect := &paho.Connect{
-		ClientID:   t.options.Name,
-		KeepAlive:  30,
-		CleanStart: cleanStart,
+	config := autopaho.ClientConfig{
+		ServerUrls:                    []*url.URL{serverURL},
+		KeepAlive:                     30,
+		CleanStartOnInitialConnection: !t.options.PersistentSession,
+		ConnectTimeout:                t.options.ConnectTimeout,
+		ReconnectBackoff:              t.reconnectBackoff(),
+		ConnectUsername:               t.options.Username,
+		OnConnectionUp:                t.onConnectionUp,
+		OnConnectionDown:              t.onConnectionDown,
+		OnConnectError:                t.onConnectError,
+		ClientConfig: paho.ClientConfig{
+			ClientID: t.options.Name,
+			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
+				t.onPublish,
+			},
+		},
 	}
-	if t.options.Username != "" {
-		connect.Username = t.options.Username
-		connect.UsernameFlag = true
+	if isTLSScheme(serverURL.Scheme) {
+		tlsConfig, err := t.options.TLS.config(serverURL.Hostname())
+		if err != nil {
+			return err
+		}
+		config.TlsCfg = tlsConfig
+	} else if t.options.TLS != nil {
+		// Refused rather than ignored. Silently dropping a TLS configuration would leave the caller
+		// believing the link is encrypted while the credentials below go over the wire in the clear.
+		return fmt.Errorf("mqtt transport: TLS options were given for the plain %q URL %q; use mqtts://", serverURL.Scheme, t.options.URL)
 	}
 	if t.options.Password != "" {
-		connect.Password = []byte(t.options.Password)
-		connect.PasswordFlag = true
+		config.ConnectPassword = []byte(t.options.Password)
 	}
 	if t.options.PersistentSession || t.options.SessionExpirySeconds > 0 {
-		seconds := t.options.SessionExpirySeconds
-		if seconds == 0 {
-			seconds = 3600
+		config.SessionExpiryInterval = t.options.SessionExpirySeconds
+		if config.SessionExpiryInterval == 0 {
+			config.SessionExpiryInterval = 3600
 		}
-		connect.Properties = &paho.ConnectProperties{SessionExpiryInterval: &seconds}
 	}
 	if t.options.PublishPresence {
-		connect.WillMessage = &paho.WillMessage{
+		config.WillMessage = &paho.WillMessage{
 			Topic:   PresenceTopic(t.options.Prefix, t.options.Name),
 			Payload: []byte(PresenceOffline),
 			Retain:  true,
 			QoS:     t.options.QoS,
 		}
 	}
-	connack, err := t.client.Connect(ctx, connect)
+
+	// Detached from the caller's context on purpose: ctx bounds how long we wait for the *first*
+	// connection, while the manager has to outlive it and keep reconnecting for the process's life.
+	manager, err := autopaho.NewConnection(context.WithoutCancel(ctx), config)
 	if err != nil {
-		_ = conn.Close()
-		return err
+		return fmt.Errorf("mqtt transport: %w", err)
 	}
-	if connack.ReasonCode >= 0x80 {
-		_ = conn.Close()
-		reason := ""
-		if connack.Properties != nil {
-			reason = connack.Properties.ReasonString
+	t.mu.Lock()
+	t.manager = manager
+	t.mu.Unlock()
+
+	waitCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline && t.options.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, t.options.ConnectTimeout)
+		defer cancel()
+	}
+	connected := make(chan error, 1)
+	go func() { connected <- manager.AwaitConnection(waitCtx) }()
+	select {
+	case err := <-connected:
+		if err != nil {
+			return t.abandonConnection(manager, err)
 		}
-		return fmt.Errorf("mqtt transport: connect refused with reason code %d %s", connack.ReasonCode, reason)
+	case <-t.refused:
+		return t.abandonConnection(manager, errors.New("broker denied the connection"))
+	case <-waitCtx.Done():
+		return t.abandonConnection(manager, waitCtx.Err())
 	}
-	return t.subscribe(ctx)
+	select {
+	case <-t.ready:
+		return nil
+	case <-waitCtx.Done():
+		return t.abandonConnection(manager, waitCtx.Err())
+	}
+}
+
+// abandonConnection tears down a manager whose first connection never completed, so a failed
+// Connect does not leave a goroutine retrying credentials the caller has already given up on.
+func (t *Transport) abandonConnection(manager *autopaho.ConnectionManager, err error) error {
+	_ = manager.Disconnect(context.Background())
+	t.mu.Lock()
+	t.manager = nil
+	connectErr := t.lastConnectErr
+	t.mu.Unlock()
+	if connectErr != nil {
+		return fmt.Errorf("mqtt transport: %w", connectErr)
+	}
+	return fmt.Errorf("mqtt transport: %w", err)
+}
+
+func (t *Transport) reconnectBackoff() func(int) time.Duration {
+	if t.options.ReconnectBackoff != nil {
+		return t.options.ReconnectBackoff
+	}
+	return autopaho.NewExponentialBackoff(time.Second, time.Minute, 2*time.Second, 2)
+}
+
+// onConnectionUp restores everything this peer was serving before the link dropped.
+//
+// A reconnect that quietly comes back subscribed to less than it was is the failure mode worth
+// guarding against: the peer looks healthy, answers presence, and silently serves nothing on the
+// topics the broker refused. So the refusals are collected and reported rather than discarded.
+func (t *Transport) onConnectionUp(manager *autopaho.ConnectionManager, _ *paho.Connack) {
+	// Must not block the connection manager, so the subscribe pass runs on its own goroutine.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), subscribeTimeout)
+		defer cancel()
+
+		t.mu.Lock()
+		first := !t.connected
+		t.connected = true
+		t.lastConnectErr = nil
+		t.mu.Unlock()
+
+		failed, err := t.subscribeAll(ctx, manager)
+		if err == nil {
+			// The retained burst starts arriving now the subscription is granted, so this is where
+			// the quiet period that decides it has finished first arms.
+			if t.options.SubscribePresence {
+				t.armPresenceSweep()
+			} else {
+				t.settlePresence()
+			}
+		}
+		if err == nil && t.options.PublishPresence {
+			err = t.publishPresence(ctx, PresenceOnline)
+		}
+		if err == nil {
+			t.readyOnce.Do(func() { close(t.ready) })
+		}
+		t.reportConnection(ConnectionEvent{Up: true, First: first, FailedSubscriptions: failed, Err: err})
+	}()
+}
+
+// onConnectionDown fails the calls that were in flight when the link dropped.
+//
+// Failing fast rather than holding them for the reconnection: the reply was to be published to a
+// topic this peer is no longer subscribed to, so waiting would usually mean waiting out the
+// caller's timeout to reach the same answer, only later.
+func (t *Transport) onConnectionDown() bool {
+	t.mu.Lock()
+	t.connected = false
+	closed := t.closed
+	t.mu.Unlock()
+
+	t.failPending(&rpc.RPCError{Code: rpc.ErrorTransport, Err: &rpc.RemoteError{Name: "RpcError", Message: "broker connection lost"}})
+	t.reportConnection(ConnectionEvent{Up: false})
+	// False stops the manager reconnecting, which is only what we want once Close has been called.
+	return !closed
+}
+
+func (t *Transport) onConnectError(err error) {
+	t.mu.Lock()
+	t.lastConnectErr = err
+	t.mu.Unlock()
+	if isRefusedIdentity(err) {
+		t.refusedOnce.Do(func() { close(t.refused) })
+	}
+}
+
+// isRefusedIdentity reports whether the broker denied this peer for who it says it is, rather than
+// failing to answer.
+//
+// The distinction decides whether retrying is worth anything. A dial that failed or a broker that is
+// still starting will succeed on a later attempt, which is the whole point of the backoff. A broker
+// that says the credentials or the client id are wrong will say so again every ten seconds until a
+// human changes something, so Connect reports it immediately instead of waiting out its window.
+func isRefusedIdentity(err error) bool {
+	var connack *autopaho.ConnackError
+	if !errors.As(err, &connack) {
+		return false
+	}
+	switch connack.ReasonCode {
+	case 0x85, // Client Identifier not valid
+		0x86, // Bad User Name or Password
+		0x87, // Not authorized
+		0x8A, // Banned
+		0x99: // Payload format invalid
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *Transport) reportConnection(event ConnectionEvent) {
+	if t.options.OnConnection != nil {
+		t.options.OnConnection(event)
+	}
 }
 
 func (t *Transport) AttachServer(server *rpc.Server) {
@@ -194,21 +394,17 @@ func (t *Transport) Close(ctx context.Context) error {
 		return nil
 	}
 	t.closed = true
+	manager := t.manager
 	t.mu.Unlock()
 
 	var result error
-	if t.options.PublishPresence && t.client != nil {
-		if err := t.publishPresence(ctx, PresenceOffline); err != nil {
-			result = err
+	if manager != nil {
+		if t.options.PublishPresence {
+			if err := t.publishPresence(ctx, PresenceOffline); err != nil {
+				result = err
+			}
 		}
-	}
-	if t.client != nil {
-		if err := t.client.Disconnect(&paho.Disconnect{ReasonCode: 0}); err != nil && result == nil {
-			result = err
-		}
-	}
-	if t.conn != nil {
-		if err := t.conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && result == nil {
+		if err := manager.Disconnect(ctx); err != nil && result == nil {
 			result = err
 		}
 	}
@@ -221,7 +417,7 @@ func (t *Transport) Announce(ctx context.Context) error {
 }
 
 func (t *Transport) Call(ctx context.Context, source string, target string, call rpc.CallPayload) (any, error) {
-	if t.client == nil {
+	if t.connectionManager() == nil {
 		return nil, &rpc.RPCError{Code: rpc.ErrorTransport, Err: &rpc.RemoteError{Name: "RpcError", Message: "transport is not connected"}}
 	}
 	frame, ok := ToFrame(rpc.Message{Type: rpc.MessageTypeRequest, Payload: call})
@@ -319,23 +515,55 @@ func (t *Transport) PublishEvent(ctx context.Context, path string, event string,
 	return nil
 }
 
-func (t *Transport) subscribe(ctx context.Context) error {
-	subscriptions := []paho.SubscribeOptions{
-		{Topic: Topic(t.options.Prefix, ChannelResponse, t.options.Name), QoS: t.options.QoS},
-		{Topic: Topic(t.options.Prefix, ChannelEvent, t.options.Name), QoS: t.options.QoS},
-		{Topic: Topic(t.options.Prefix, ChannelRequest, t.options.Name), QoS: t.options.QoS},
+// subscriptionTopics is everything this peer needs the broker to route to it. The same list is used
+// for the first connection and every restoration after a drop, so the two cannot drift apart.
+func (t *Transport) subscriptionTopics() []string {
+	topics := []string{
+		Topic(t.options.Prefix, ChannelResponse, t.options.Name),
+		Topic(t.options.Prefix, ChannelEvent, t.options.Name),
+		Topic(t.options.Prefix, ChannelRequest, t.options.Name),
 	}
 	if t.options.SubscribePresence {
-		subscriptions = append(subscriptions, paho.SubscribeOptions{Topic: t.options.Prefix + "/presence/+", QoS: t.options.QoS})
+		topics = append(topics, t.options.Prefix+"/presence/+")
 	}
-	_, err := t.client.Subscribe(ctx, &paho.Subscribe{Subscriptions: subscriptions})
+	return topics
+}
+
+// subscribeAll subscribes every topic and names the ones the broker refused.
+//
+// A SUBACK carries a reason code per topic, and a refusal there is not an error on the call: the
+// subscribe succeeds while leaving this peer deaf on that topic. Reading the codes is the only way
+// to tell the difference.
+func (t *Transport) subscribeAll(ctx context.Context, manager *autopaho.ConnectionManager) ([]string, error) {
+	topics := t.subscriptionTopics()
+	subscriptions := make([]paho.SubscribeOptions, 0, len(topics))
+	for _, topic := range topics {
+		subscriptions = append(subscriptions, paho.SubscribeOptions{Topic: topic, QoS: t.options.QoS})
+	}
+	suback, err := manager.Subscribe(ctx, &paho.Subscribe{Subscriptions: subscriptions})
 	if err != nil {
-		return err
+		return topics, err
 	}
-	if t.options.PublishPresence {
-		return t.publishPresence(ctx, PresenceOnline)
+	return refusedSubscriptions(topics, suback), nil
+}
+
+// refusedSubscriptions names the topics whose SUBACK reason code is a failure. Reason codes at or
+// above 0x80 are refusals; anything below is the granted QoS.
+func refusedSubscriptions(topics []string, suback *paho.Suback) []string {
+	if suback == nil {
+		return nil
 	}
-	return nil
+	var refused []string
+	for index, topic := range topics {
+		if index >= len(suback.Reasons) {
+			refused = append(refused, topic)
+			continue
+		}
+		if suback.Reasons[index] >= 0x80 {
+			refused = append(refused, topic)
+		}
+	}
+	return refused
 }
 
 func (t *Transport) onPublish(pr paho.PublishReceived) (bool, error) {
@@ -343,7 +571,11 @@ func (t *Transport) onPublish(pr paho.PublishReceived) (bool, error) {
 	if packet == nil {
 		return false, nil
 	}
+	// Stamped before any work, because it is what the caller's budget is measured from. Anything
+	// this peer spends decoding and verifying is time the caller is already waiting.
+	arrived := time.Now()
 	if strings.HasPrefix(packet.Topic, t.options.Prefix+"/presence/") {
+		t.handlePresence(packet)
 		return true, nil
 	}
 	frame, source, contentType, err := t.decodePublish(packet)
@@ -361,7 +593,12 @@ func (t *Transport) onPublish(pr paho.PublishReceived) (bool, error) {
 		t.deliverResponse(frame.Correlation, message)
 	case ChannelRequest:
 		if t.server != nil {
-			go t.answerRequest(source, packet, frame, message)
+			responseTopic, reason := t.resolveResponseTopic(responseTopicOf(packet), source)
+			if reason != "" {
+				t.reject(packet, source, reason, nil)
+				return true, nil
+			}
+			go t.answerRequest(source, packet, responseTopic, frame, message, arrived)
 		}
 	case ChannelEvent:
 		t.deliverEvent(source, message)
@@ -370,32 +607,40 @@ func (t *Transport) onPublish(pr paho.PublishReceived) (bool, error) {
 	return true, nil
 }
 
-func (t *Transport) answerRequest(source string, packet *paho.Publish, frame Frame, message rpc.Message) {
+func (t *Transport) answerRequest(source string, packet *paho.Publish, responseTopic string, frame Frame, message rpc.Message, arrived time.Time) {
 	call, ok := message.Payload.(rpc.CallPayload)
 	if !ok {
 		return
 	}
 	identity, _ := t.Identity(source)
 	if frame.Kind == KindSubscribe || frame.Kind == KindUnsubscribe {
-		t.answerSubscription(source, identity, packet, frame, call)
+		t.answerSubscription(source, identity, packet, responseTopic, frame, call)
 		return
 	}
-	reply := t.server.DispatchWithIdentity(context.Background(), source, identity, call)
-	t.answer(source, packet, frame, reply)
+	// The caller's budget bounds the method as well as deciding whether to run it at all: a handler
+	// left running past the point its caller gave up holds a reply nobody is waiting for.
+	ctx := context.Background()
+	if call.TTL > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, arrived.Add(time.Duration(call.TTL)*time.Millisecond))
+		defer cancel()
+	}
+	reply := t.server.DispatchArrivedWithIdentity(ctx, source, identity, call, arrived)
+	t.answer(packet, responseTopic, frame, reply)
 }
 
-func (t *Transport) answerSubscription(source string, identity *rpc.Identity, packet *paho.Publish, frame Frame, call rpc.CallPayload) {
+func (t *Transport) answerSubscription(source string, identity *rpc.Identity, packet *paho.Publish, responseTopic string, frame Frame, call rpc.CallPayload) {
 	if len(call.Params) < 1 {
-		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorInvalidParams, call.Path+"."+call.Method+" expects an event name"))
+		t.answer(packet, responseTopic, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorInvalidParams, call.Path+"."+call.Method+" expects an event name"))
 		return
 	}
 	event, ok := call.Params[0].(string)
 	if !ok || event == "" {
-		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorInvalidParams, call.Path+"."+call.Method+" expects an event name"))
+		t.answer(packet, responseTopic, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorInvalidParams, call.Path+"."+call.Method+" expects an event name"))
 		return
 	}
 	if t.server != nil && !t.server.HasEvent(call.Path, event) {
-		t.answer(source, packet, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorMethodNotFound, call.Path+"."+event+" is not a described event"))
+		t.answer(packet, responseTopic, frame, rpc.NewErrorPayload(call.ID, rpc.ErrorMethodNotFound, call.Path+"."+event+" is not a described event"))
 		return
 	}
 	if t.server != nil {
@@ -409,7 +654,7 @@ func (t *Transport) answerSubscription(source string, identity *rpc.Identity, pa
 		}
 		requiresAuthority := t.server.EventRequiresAuthority(call.Path, event)
 		if err := t.server.CheckAuthorization(context.Background(), callContext, requiresAuthority); err != nil {
-			t.answer(source, packet, frame, rpc.ErrorPayload{ID: call.ID, Type: rpc.RPCMessageError, Code: err.Code, Error: err.Err})
+			t.answer(packet, responseTopic, frame, rpc.ErrorPayload{ID: call.ID, Type: rpc.RPCMessageError, Code: err.Code, Error: err.Err})
 			return
 		}
 	}
@@ -427,10 +672,13 @@ func (t *Transport) answerSubscription(source string, identity *rpc.Identity, pa
 		}
 	}
 	t.mu.Unlock()
-	t.answer(source, packet, frame, rpc.NewSuccessPayload(call.ID, "ok"))
+	t.answer(packet, responseTopic, frame, rpc.NewSuccessPayload(call.ID, "ok"))
 }
 
-func (t *Transport) answer(source string, packet *paho.Publish, frame Frame, reply any) {
+// answer publishes a reply on the topic resolveResponseTopic already settled on. The topic is
+// decided once, on the receive path, so that a request naming a hostile one is refused before any
+// method runs rather than having its answer redirected afterwards.
+func (t *Transport) answer(packet *paho.Publish, responseTopic string, frame Frame, reply any) {
 	if reply == nil {
 		return
 	}
@@ -438,16 +686,9 @@ func (t *Transport) answer(source string, packet *paho.Publish, frame Frame, rep
 	if !ok {
 		return
 	}
-	responseTopic := ""
 	contentType := t.codec.ContentType()
-	if packet.Properties != nil {
-		responseTopic = packet.Properties.ResponseTopic
-		if packet.Properties.ContentType != "" {
-			contentType = packet.Properties.ContentType
-		}
-	}
-	if responseTopic == "" {
-		responseTopic = Topic(t.options.Prefix, ChannelResponse, source)
+	if packet.Properties != nil && packet.Properties.ContentType != "" {
+		contentType = packet.Properties.ContentType
 	}
 	replyFrame.Correlation = frame.Correlation
 	if err := t.publishFrameToTopic(context.Background(), t.options.Name, responseTopic, replyFrame, contentType); err != nil {
@@ -492,6 +733,10 @@ func (t *Transport) publishFrame(ctx context.Context, source string, target stri
 }
 
 func (t *Transport) publishFrameToTopic(ctx context.Context, source string, topic string, frame Frame, contentType string) error {
+	manager := t.connectionManager()
+	if manager == nil {
+		return errors.New("mqtt transport: not connected")
+	}
 	body, err := t.encodeBody(contentType, frame.Body)
 	if err != nil {
 		return err
@@ -547,7 +792,7 @@ func (t *Transport) publishFrameToTopic(ctx context.Context, source string, topi
 		control[MRSignature] = signature
 	}
 	properties.User = userProperties(control)
-	_, err = t.client.Publish(ctx, &paho.Publish{
+	_, err = manager.Publish(ctx, &paho.Publish{
 		Topic:      topic,
 		QoS:        t.options.QoS,
 		Properties: properties,
@@ -565,6 +810,12 @@ func (t *Transport) decodePublish(packet *paho.Publish) (Frame, string, string, 
 		return Frame{}, "", "", err
 	}
 	source := properties[MRSource]
+	// Checked once, here, because everything downstream trusts it: the source names a topic this
+	// peer publishes to and keys the subscription and identity maps. A name carrying `#` or a NUL
+	// would reach all of those.
+	if source != "" && !isSafeTopicSegment(source) {
+		return Frame{}, "", "", fmt.Errorf("unusable %s", MRSource)
+	}
 	contentType := packet.Properties.ContentType
 	if contentType != "" && !t.supportedContentType(contentType) {
 		return Frame{}, source, "", fmt.Errorf("unsupported content type %q", contentType)
@@ -585,6 +836,9 @@ func (t *Transport) decodePublish(packet *paho.Publish) (Frame, string, string, 
 	if !ok {
 		return Frame{}, source, "", errors.New("invalid control properties")
 	}
+	// After verification, never before: the signature covers the ttl the caller stated, and what the
+	// broker has left of it is not part of what was signed.
+	frame.TTL = remainingTTL(frame.TTL, packet.Properties.MessageExpiry)
 	return frame, source, contentType, nil
 }
 
@@ -681,13 +935,31 @@ func (t *Transport) encodeBody(contentType string, body any) ([]byte, error) {
 	return nil, fmt.Errorf("unsupported content type %q", contentType)
 }
 
+func (t *Transport) connectionManager() *autopaho.ConnectionManager {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.manager
+}
+
 func (t *Transport) publishPresence(ctx context.Context, state string) error {
-	_, err := t.client.Publish(ctx, &paho.Publish{
+	manager := t.connectionManager()
+	if manager == nil {
+		return errors.New("mqtt transport: not connected")
+	}
+	publish := &paho.Publish{
 		Topic:   PresenceTopic(t.options.Prefix, t.options.Name),
 		QoS:     t.options.QoS,
 		Retain:  true,
 		Payload: []byte(state),
-	})
+	}
+	// The shape rides beside the payload, never inside it: the payload has to stay the exact string
+	// every already-deployed peer compares against.
+	if state == PresenceOnline && t.options.Shape != "" {
+		publish.Properties = &paho.PublishProperties{
+			User: userProperties(map[string]string{shapeProperty: t.options.Shape}),
+		}
+	}
+	_, err := manager.Publish(ctx, publish)
 	return err
 }
 
@@ -755,6 +1027,30 @@ func serverEventKey(path string, event string) string {
 	return path + "\x00" + event
 }
 
+// remainingTTL is what is left of the caller's stated budget.
+//
+// MQTT 5 requires a broker to hand on the Message Expiry Interval it received minus the time the
+// message spent queued in it, so for a request that waited this is the caller's own budget with the
+// queueing already deducted — measured by the broker, with neither peer's clock entering into it.
+// Taken as an upper bound only: expiry is whole seconds and a broker of unknown quality set it, so
+// it may shorten what the caller signed and never lengthen it.
+func remainingTTL(stated int64, expirySeconds *uint32) int64 {
+	if stated <= 0 || expirySeconds == nil {
+		return stated
+	}
+	if remaining := int64(*expirySeconds) * 1000; remaining < stated {
+		return remaining
+	}
+	return stated
+}
+
+func responseTopicOf(packet *paho.Publish) string {
+	if packet == nil || packet.Properties == nil {
+		return ""
+	}
+	return packet.Properties.ResponseTopic
+}
+
 func requestExpiry(ttl int64, fallback uint32) uint32 {
 	if ttl <= 0 {
 		return fallback
@@ -800,23 +1096,33 @@ func sourceFromPublish(packet *paho.Publish) string {
 	return ""
 }
 
-func brokerAddress(raw string) (string, error) {
+// brokerURL normalises the broker address into the form the connection manager dials, filling in
+// the port that goes with the scheme so a URL without one does not depend on the library's default.
+//
+// WebSocket schemes are refused rather than passed through: this implementation is MQTT-first by
+// design, and a ws:// peer belongs on the TypeScript side.
+func brokerURL(raw string) (*url.URL, error) {
 	if raw == "" {
-		raw = "mqtt://localhost:1883"
+		raw = "mqtt://localhost:" + defaultPlainPort
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if parsed.Scheme != "mqtt" {
-		return "", fmt.Errorf("mqtt transport: unsupported broker scheme %q", parsed.Scheme)
+	switch {
+	case isPlainScheme(parsed.Scheme), isTLSScheme(parsed.Scheme):
+	default:
+		return nil, fmt.Errorf("mqtt transport: unsupported broker scheme %q", parsed.Scheme)
 	}
-	host := parsed.Host
-	if host == "" {
-		return "", fmt.Errorf("mqtt transport: broker URL %q has no host", raw)
+	if parsed.Hostname() == "" {
+		return nil, fmt.Errorf("mqtt transport: broker URL %q has no host", raw)
 	}
 	if parsed.Port() == "" {
-		host = net.JoinHostPort(parsed.Hostname(), strconv.Itoa(1883))
+		port := defaultPlainPort
+		if isTLSScheme(parsed.Scheme) {
+			port = defaultTLSPort
+		}
+		parsed.Host = net.JoinHostPort(parsed.Hostname(), port)
 	}
-	return host, nil
+	return parsed, nil
 }
