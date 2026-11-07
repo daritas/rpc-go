@@ -24,6 +24,7 @@ func TestSignedGoClientCallsTypeScriptServer(t *testing.T) {
 		brokerURL = "mqtt://localhost:1883"
 	}
 	requireBroker(t, tcpAddress(t, brokerURL))
+	requireUsableBroker(t, brokerURL)
 	tsDist := requireTypeScriptRPCDist(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -78,6 +79,7 @@ func TestSignedTypeScriptClientCallsGoServer(t *testing.T) {
 		brokerURL = "mqtt://localhost:1883"
 	}
 	requireBroker(t, tcpAddress(t, brokerURL))
+	requireUsableBroker(t, brokerURL)
 	tsDist := requireTypeScriptRPCDist(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -132,6 +134,7 @@ func TestTypeScriptSignedForgedAndReplayedFramesAgainstGoServer(t *testing.T) {
 		brokerURL = "mqtt://localhost:1883"
 	}
 	requireBroker(t, tcpAddress(t, brokerURL))
+	requireUsableBroker(t, brokerURL)
 	tsDist := requireTypeScriptRPCDist(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -299,6 +302,24 @@ func requireTypeScriptRPCDist(t *testing.T) string {
 	}
 	t.Skip("TypeScript @source-repo/rpc dist not found; set MSGRPC_TEST_TS_DIST")
 	return ""
+}
+
+func requireUsableBroker(t *testing.T, brokerURL string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	transport := NewTransport(TransportOptions{
+		URL:      brokerURL,
+		Name:     "goTsInteropProbe-" + rpc.NewID(),
+		Prefix:   "msgrpc/go-ts-probe/" + rpc.NewID(),
+		Username: os.Getenv("MSGRPC_TEST_BROKER_USERNAME"),
+		Password: os.Getenv("MSGRPC_TEST_BROKER_PASSWORD"),
+	})
+	if err := transport.Connect(ctx); err != nil {
+		skipBrokerConnect(t, err)
+	}
+	defer transport.Close(context.Background())
 }
 
 func fileExists(path string) bool {
