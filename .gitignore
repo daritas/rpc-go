@@ -12,3 +12,6 @@ examples/program_node/program_node
 
 # Local storage used by the program-node example.
 programs/
+
+# Agent/editor MCP configuration, not source.
+.mcp.json
